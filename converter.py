@@ -53,11 +53,18 @@ from anthropic_adapter import (
     AnthropicStreamConverter,
     anthropic_request_to_chat,
 )
+from checkin import billing_ua
+from model_registry import (
+    FALLBACK_MODELS,
+    ModelFetchError,
+    ModelRegistry,
+)
 from responses_adapter import (
     ResponsesStreamConverter,
     responses_request_to_chat,
 )
 from responses_projection import project_responses_chat_body
+from task_scheduler import TASK_KEYS, TASK_LABELS, TaskConfig, TaskScheduler
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -137,11 +144,11 @@ class CredentialManager:
             raise RuntimeError(f"无法读取 auth 文件：{self.path}")
         return self._cached
 
-    def _is_expired(self) -> bool:
+    def _is_expired(self, within_ms: int = 60_000) -> bool:
         s = self._session()
         expires_at = (s.get("auth") or {}).get("expiresAt") or 0
-        # 提前 60s 判定过期
-        return time.time() * 1000 >= (expires_at - 60_000)
+        # 提前 within_ms 判定过期；within_ms <= 0 表示只看硬过期
+        return time.time() * 1000 >= (expires_at - max(0, within_ms))
 
     def _refresh(self):
         """调后端刷新 token，写回 auth 文件与缓存。"""
@@ -195,10 +202,14 @@ class CredentialManager:
         }
         return h
 
-    def get_headers(self) -> dict:
-        """返回带最新 token 的后端请求 header；必要时先刷新。"""
+    def get_headers(self, within_ms: int = 60_000) -> dict:
+        """返回带最新 token 的后端请求 header；必要时先刷新。
+
+        within_ms：提前多少毫秒判定「即将过期」并主动刷新。默认 60s（聊天路径，
+        宁可请求时再刷）；签到等定时任务传 2h 窗口，避免到点时 token 已过期。
+        """
         with self._lock:
-            if self._is_expired():
+            if self._is_expired(within_ms):
                 self._refresh()
             s = self._session()
             return self._build_headers_from(s.get("auth") or {}, s.get("account") or {})
@@ -219,21 +230,16 @@ class CredentialManager:
 
 # ---------------------------------------------------------------------------
 # 模型列表
+#
+# 解析顺序（前者可用即返回，逐级降级）：
+#   1. 上游动态拉取   GET {BACKEND}/console/enterprises/personal/models（CLI 白名单裁剪）
+#   2. 本地快照       models-snapshot.json（上游失败时的上一份真实列表，标记 stale-*）
+#   3. 本机 product.json（WorkBuddy 安装目录，见 _load_models_from_workbuddy）
+#   4. 内置回退表     DEFAULT_MODELS（仅当以上全不可用）
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODELS = [
-    "glm-5.2",
-    "glm-5.1",
-    "glm-5v-turbo",
-    "kimi-k2.7",
-    "kimi-k2.6",
-    "kimi-k2.5",
-    "deepseek-v4-pro",
-    "deepseek-v4-flash",
-    "minimax-m3-pay",
-    "hy3-preview-agent",
-    "auto",
-]
+#: 最终兜底表；内容与 model_registry.FALLBACK_MODELS 同源（上游实测，2026-09-12）。
+DEFAULT_MODELS = list(FALLBACK_MODELS)
 
 # 标识非聊天模型的 tag（需要过滤掉）
 NON_CHAT_MODEL_TAGS = {
@@ -357,23 +363,49 @@ def _load_models_from_workbuddy() -> list[str]:
         return []
 
 
+def _safe_cred_headers(within_ms: int = 60_000) -> dict | None:
+    """取一份带最新 token 的请求头；取不到返回 None（调用方自行回退）。"""
+    cred = CONFIG.get("cred")
+    if cred is None:
+        return None
+    try:
+        return cred.get_headers(within_ms=within_ms)
+    except Exception as e:  # noqa: BLE001
+        _log(f"[models] WARN 取凭据失败，走回退：{e}")
+        return None
+
+
 def get_available_models() -> list[str]:
     """
-    获取可用的模型列表。
+    获取可用的模型 ID 列表（兼容旧调用）。
 
-    优先从 WorkBuddy product.json 读取，如果失败则使用 DEFAULT_MODELS。
-
-    Returns:
-        模型 ID 列表
+    优先动态拉取，其次本机 product.json，最后内置表。详见 resolve_models()。
     """
-    workbuddy_models = _load_models_from_workbuddy()
+    models, _source = resolve_models()
+    return [m["id"] for m in models]
 
-    if workbuddy_models:
-        # 成功从 WorkBuddy 加载，使用动态列表
-        return workbuddy_models
-    else:
-        # 降级到硬编码列表
-        return DEFAULT_MODELS
+
+def resolve_models(force: bool = False) -> tuple[list[dict], str]:
+    """
+    解析模型列表，返回 (OpenAI 格式条目, 来源标记)。
+
+    来源标记：upstream / cache / stale-memory / stale-snapshot / local-product / static。
+    """
+    reg = CONFIG.get("registry")
+    if reg is not None:
+        headers = _safe_cred_headers()
+        try:
+            infos, source = reg.resolve(headers, force=force)
+            return [i.to_dict() for i in infos], source
+        except ModelFetchError as e:
+            _log(f"[models] WARN 动态拉取不可用：{e}")
+        except Exception as e:  # noqa: BLE001
+            _log(f"[models] WARN 动态拉取异常：{e}")
+
+    local = _load_models_from_workbuddy()
+    if local:
+        return [{"id": m, "object": "model", "owned_by": "codebuddy"} for m in local], "local-product"
+    return [{"id": m, "object": "model", "owned_by": "codebuddy"} for m in DEFAULT_MODELS], "static"
 
 
 # 后端请求体里出现过的额外字段（透传时若客户端给了就保留）
@@ -411,7 +443,13 @@ CONFIG: dict = {
     "log_path": None,
     "desensitize": False,
     "no_compact": False,
-}  # cred: CredentialManager | None
+    "registry": None,
+    "checkin": None,
+    "tasks": None,
+}
+# cred: CredentialManager | None；registry: ModelRegistry | None
+# checkin: CheckinScheduler | None（签到执行体，供 /admin/checkin 沿用旧结构）
+# tasks:   TaskScheduler | None（六类定时任务的统一排程）
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +475,12 @@ def _log(msg: str):
 def _truncate(s: str, n: int = 80) -> str:
     s = str(s).replace("\n", " ").strip()
     return s[:n] + ("…" if len(s) > n else "")
+
+
+def _pad_label(s: str, width: int = 16) -> str:
+    """按显示宽度（CJK 算 2 列）左侧补齐，让启动横幅里的中文标签能对齐。"""
+    w = sum(2 if ord(ch) > 0x2E80 else 1 for ch in s)
+    return s + " " * max(1, width - w)
 
 
 def _check_auth(authorization: str | None, x_api_key: str | None):
@@ -484,21 +528,188 @@ def health():
             info["credential"] = cred.summary()
         except Exception as e:
             info["credential_error"] = str(e)
+    reg = CONFIG.get("registry")
+    if reg is not None:
+        st = reg.status()
+        info["models"] = {
+            "source": st["source"],
+            "count": st["models"],
+            "age_seconds": st["age_seconds"],
+            "fresh": st["fresh"],
+        }
+    sched = CONFIG.get("checkin")
+    if sched is not None:
+        st = sched.status()
+        info["checkin"] = {
+            "enabled": st["enabled"],
+            "hours": st["hours"],
+            "next_fire_at": st["next_fire_at"],
+            "last": st["last"],
+        }
+    tasks = CONFIG.get("tasks")
+    if tasks is not None:
+        st = tasks.status()
+        info["tasks"] = {
+            "alive": st["alive"],
+            "next_wake_at": st["next_wake_at"],
+            "next_wake_tasks": st["next_wake_tasks"],
+            "enabled": [k for k in TASK_KEYS if st["tasks"][k]["enabled"]],
+            "last": {k: (st["tasks"][k]["last"] or {}).get("summary") for k in TASK_KEYS},
+        }
     return info
 
 
 @app.get("/v1/models")
 def list_models(
+    refresh: int = 0,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-Api-Key"),
 ):
+    """OpenAI 兼容模型列表。
+
+    默认走缓存（TTL 1h，见 model_registry）；`?refresh=1` 强制重拉上游。
+    """
     _check_auth(authorization, x_api_key)
-    models = get_available_models()
-    data = [
-        {"id": m, "object": "model", "created": 1700000000, "owned_by": "codebuddy"}
-        for m in models
-    ]
-    return {"object": "list", "data": data}
+    data, source = resolve_models(force=bool(refresh))
+    for item in data:
+        item.setdefault("created", 1700000000)
+    resp = {"object": "list", "data": data}
+    if source.startswith("stale-") or source in ("static", "local-product"):
+        # 非新鲜来源时给出标记，方便客户端判断列表是否可能过期
+        resp["x_models_source"] = source
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# 管理端点（模型缓存 / 自动签到 / 六类定时任务）
+# ---------------------------------------------------------------------------
+
+
+@app.get("/admin/models")
+def admin_models(
+    refresh: int = 0,
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-Api-Key"),
+):
+    """模型注册表状态；`?refresh=1` 强制重拉一次。"""
+    _check_auth(authorization, x_api_key)
+    reg = CONFIG.get("registry")
+    if reg is None:
+        return {"enabled": False, "reason": "动态模型未启用（--no-dynamic-models）"}
+    if refresh:
+        try:
+            resolve_models(force=True)
+        except Exception as e:  # noqa: BLE001
+            _log(f"[models] WARN 强制刷新失败：{e}")
+    st = reg.status()
+    if refresh:
+        st["source"] = "manual-refresh"
+    return st
+
+
+@app.get("/admin/checkin")
+def admin_checkin_status(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-Api-Key"),
+):
+    """签到调度状态 + 最近结果。
+
+    签到的**排程**现在由六类任务调度器统一负责（保持与旅行/活跃同槽并行、共用补跑窗口），
+    这里返回的 `alive` 因此反映的是任务调度线程；`scheduled_by` 标明这一点，
+    免得看到 `alive=false` 误以为签到没在跑。
+    """
+    _check_auth(authorization, x_api_key)
+    sched = CONFIG.get("checkin")
+    if sched is None:
+        return {"enabled": False, "reason": CONFIG.get("checkin_reason") or "自动签到未启用"}
+    st = sched.status()
+    tasks = CONFIG.get("tasks")
+    if tasks is not None:
+        st["scheduled_by"] = "task_scheduler"
+        st["alive"] = bool(tasks.is_alive() and tasks.enabled.get("checkin"))
+    return st
+
+
+@app.post("/admin/checkin")
+def admin_checkin_run(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-Api-Key"),
+):
+    """立即执行一次签到 + 余额查询（不影响既定排程）。"""
+    _check_auth(authorization, x_api_key)
+    sched = CONFIG.get("checkin")
+    if sched is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "message": CONFIG.get("checkin_reason") or "自动签到未启用",
+                    "type": "disabled",
+                }
+            },
+        )
+    return sched.run_once(reason="manual")
+
+
+@app.get("/admin/tasks")
+def admin_tasks_status(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-Api-Key"),
+):
+    """六类定时任务的排程状态 + 最近结果。
+
+    六类 = 签到 / 活跃上报 / 猫猫旅行 / token 保活 / 开学季 / 夜猫子，
+    各自独立时点、独立开关，互不影响。
+    """
+    _check_auth(authorization, x_api_key)
+    tasks = CONFIG.get("tasks")
+    if tasks is None:
+        return {
+            "enabled": False,
+            "reason": CONFIG.get("tasks_reason") or "定时任务未启用",
+            "tasks": {},
+        }
+    return tasks.status()
+
+
+@app.post("/admin/tasks")
+def admin_tasks_run(
+    task: str = "all",
+    key: str = "",
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-Api-Key"),
+):
+    """立即执行任务（不影响既定排程）。
+
+    `?task=all` 跑全部已启用任务；`?task=travel` 等跑单类。
+    兼容写法：`?key=travel`（与 `?task=` 等价，二者取其一即可）。
+    """
+    _check_auth(authorization, x_api_key)
+    tasks = CONFIG.get("tasks")
+    if tasks is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": {
+                    "message": CONFIG.get("tasks_reason") or "定时任务未启用",
+                    "type": "disabled",
+                }
+            },
+        )
+    which = (key or task or "all").strip().lower()
+    if which in ("all", "", "*"):
+        return {"results": [oc.as_dict() for oc in tasks.run_all_tasks(reason="manual")]}
+    if which not in TASK_KEYS:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "message": f"未知任务 {which!r}，可选：all、{', '.join(TASK_KEYS)}",
+                    "type": "invalid_request",
+                }
+            },
+        )
+    return tasks.run_task(which, reason="manual").as_dict()
 
 
 @app.post("/v1/chat/completions")
@@ -1464,6 +1675,39 @@ def preflight() -> bool:
         except Exception as e:
             sys.stderr.write(f"[警告] 读取凭据失败：{e}\n")
             ok = False
+    reg = CONFIG.get("registry")
+    if reg is None:
+        sys.stderr.write("模型列表  : 动态拉取已禁用（仅本地 product.json / 内置表）\n")
+    else:
+        st = reg.status()
+        sys.stderr.write(
+            f"模型列表  : 动态拉取（TTL {st['ttl_seconds']}s，"
+            f"快照 {st['snapshot_file']}{'' if st['snapshot_exists'] else ' [暂无]'}）\n"
+        )
+    sched = CONFIG.get("checkin")
+    if sched is None:
+        sys.stderr.write(f"自动签到  : {CONFIG.get('checkin_reason') or '已禁用'}\n")
+    else:
+        sys.stderr.write(
+            "自动签到  : 已启用，每日 "
+            + "、".join(f"{h:02d}:00" for h in sched.hours)
+            + f"（billing UA: {billing_ua()}）\n"
+        )
+    tasks = CONFIG.get("tasks")
+    if tasks is None:
+        sys.stderr.write(f"定时任务  : {CONFIG.get('tasks_reason') or '已禁用'}\n")
+    else:
+        for key in TASK_KEYS:
+            st = tasks.task_status(key)
+            label = TASK_LABELS[key]
+            if not st["enabled"]:
+                sys.stderr.write(f"定时任务  : {label} 已关闭\n")
+                continue
+            sys.stderr.write(
+                f"定时任务  : {label} 每日 "
+                + "、".join(f"{h:02d}:00" for h in st["hours"])
+                + "\n"
+            )
     sys.stderr.write("================\n")
     return ok
 
@@ -1500,6 +1744,103 @@ def main():
         "但审核误拦风险略高于默认压缩模式。",
     )
     ap.add_argument("--skip-check", action="store_true", help="跳过启动预检")
+    ap.add_argument(
+        "--models-ttl",
+        type=int,
+        default=int(os.environ.get("CODEBUDDY2OPENAI_MODELS_TTL") or 3600),
+        metavar="SECONDS",
+        help="动态模型列表的内存缓存时长，默认 3600（1 小时）。",
+    )
+    ap.add_argument(
+        "--no-dynamic-models",
+        action="store_true",
+        help="关闭上游动态模型拉取，只用本机 product.json / 内置回退表。",
+    )
+    ap.add_argument(
+        "--cache-dir",
+        default=os.environ.get("CODEBUDDY2OPENAI_CACHE_DIR") or None,
+        metavar="PATH",
+        help="落盘目录（模型快照 + 签到留档）。"
+        "默认 Windows: %%LOCALAPPDATA%%\\codebuddy2openai，其他平台: ~/.cache/codebuddy2openai。",
+    )
+    ap.add_argument(
+        "--checkin-hours",
+        default=os.environ.get("CODEBUDDY2OPENAI_CHECKIN_HOURS"),
+        metavar="H,H,...",
+        help="每日自动签到的整点时刻，逗号分隔，默认 9,21"
+        "（也可用环境变量 CODEBUDDY2OPENAI_CHECKIN_HOURS）。"
+        "传空串等同于未配置（仍回落 9,21）。关闭请用 --no-checkin。",
+    )
+    ap.add_argument(
+        "--travel-hours",
+        default=os.environ.get("CODEBUDDY2OPENAI_TRAVEL_HOURS"),
+        metavar="H,H,...",
+        help="猫猫旅行巡检的整点时刻，默认 9,21（一趟派出 + 一趟领奖）。"
+        "关闭请用 --no-travel。",
+    )
+    ap.add_argument(
+        "--activity-hours",
+        default=os.environ.get("CODEBUDDY2OPENAI_ACTIVITY_HOURS"),
+        metavar="H,H,...",
+        help="活跃上报的整点时刻，默认 10。关闭请用 --no-activity。",
+    )
+    ap.add_argument(
+        "--keepalive-hours",
+        default=os.environ.get("CODEBUDDY2OPENAI_KEEPALIVE_HOURS"),
+        metavar="H,H,...",
+        help="token 保活（主动刷新）的整点时刻，默认 22。关闭请用 --no-keepalive。",
+    )
+    ap.add_argument(
+        "--school-hours",
+        default=os.environ.get("CODEBUDDY2OPENAI_SCHOOL_HOURS"),
+        metavar="H,H,...",
+        help="开学季任务（点亮 + 领奖 + 抽空抽奖余额）的整点时刻，默认 12。"
+        "活动下线时自动跳过。关闭请用 --no-school。",
+    )
+    ap.add_argument(
+        "--cat-hours",
+        default=os.environ.get("CODEBUDDY2OPENAI_CAT_HOURS"),
+        metavar="H,H,...",
+        help="夜猫子任务的整点时刻，默认 1（夜猫窗口 23:00–08:00 CST 内补一次）。"
+        "关闭请用 --no-cat。",
+    )
+    ap.add_argument("--no-travel", action="store_true", help="关闭猫猫旅行任务。")
+    ap.add_argument("--no-activity", action="store_true", help="关闭活跃上报任务。")
+    ap.add_argument(
+        "--no-keepalive", action="store_true", help="关闭 token 保活任务（不主动刷新 token）。"
+    )
+    ap.add_argument("--no-school", action="store_true", help="关闭开学季任务。")
+    ap.add_argument("--no-cat", action="store_true", help="关闭夜猫子任务。")
+    ap.add_argument(
+        "--no-tasks",
+        action="store_true",
+        help="关闭全部六类定时任务（含签到），只提供 API 转换能力。",
+    )
+    ap.add_argument(
+        "--activity-report-count",
+        type=int,
+        default=int(os.environ.get("CODEBUDDY2OPENAI_ACTIVITY_REPORT_COUNT") or 5),
+        metavar="N",
+        help="每次活跃上报的条数，默认 5（领猫前置需 5 次对话）。"
+        "0 / 负数按 1 条处理（旧行为：只点亮连登）。",
+    )
+    ap.add_argument(
+        "--no-checkin", action="store_true", help="关闭每日自动签到线程。"
+    )
+    ap.add_argument(
+        "--checkin-on-start",
+        action="store_true",
+        help="进程启动时立刻签到一次，之后按 --checkin-hours 排程。",
+    )
+    ap.add_argument(
+        "--checkin-timeout",
+        "--task-timeout",
+        type=int,
+        default=60,
+        dest="checkin_timeout",
+        metavar="SECONDS",
+        help="签到 / 活跃上报 / 旅行 / 保活 / 开学季 / 夜猫子的单次请求超时，默认 60。",
+    )
     args = ap.parse_args()
 
     CONFIG["api_key"] = args.api_key
@@ -1512,13 +1853,70 @@ def main():
     af = find_auth_file()
     CONFIG["cred"] = CredentialManager(af) if af else None
 
+    # 动态模型注册表（上游拉取 + 内存缓存 + 落盘快照 + 多级回退）
+    registry = ModelRegistry(
+        base_url=BACKEND,
+        cache_dir=args.cache_dir,
+        ttl=args.models_ttl,
+        enabled=not args.no_dynamic_models,
+        log=_log,
+    )
+    CONFIG["registry"] = registry
+
+    # 六类定时积分任务的统一排程（签到 / 活跃上报 / 猫猫旅行 / token 保活 / 开学季 / 夜猫子）。
+    # 各类独立时点、独立开关；无凭据时不建调度器：任务必然失败，且凭据在进程内不会恢复
+    # （与聊天路径同一条限制）。
+    task_cfg = TaskConfig(
+        checkin_hours=args.checkin_hours,
+        travel_hours=args.travel_hours,
+        activity_hours=args.activity_hours,
+        keepalive_hours=args.keepalive_hours,
+        school_hours=args.school_hours,
+        cat_hours=args.cat_hours,
+        checkin_enabled=not args.no_checkin,
+        travel_enabled=not args.no_travel,
+        activity_enabled=not args.no_activity,
+        keepalive_enabled=not args.no_keepalive,
+        school_enabled=not args.no_school,
+        cat_enabled=not args.no_cat,
+        activity_report_count=args.activity_report_count,
+        timeout=args.checkin_timeout,
+    )
+    if args.no_tasks:
+        tasks = None
+        _tasks_reason = "定时任务未启用（--no-tasks）"
+    elif CONFIG["cred"] is None:
+        tasks = None
+        _tasks_reason = "未找到登录凭据，定时任务未启用"
+        sys.stderr.write(f"[警告] {_tasks_reason}。\n")
+    else:
+        tasks = TaskScheduler(
+            CONFIG["cred"],
+            config=task_cfg,
+            cache_dir=registry.cache_dir,
+            run_on_start=("checkin",) if args.checkin_on_start else (),
+            log=_log,
+        )
+        _tasks_reason = ""
+    CONFIG["tasks"] = tasks
+    CONFIG["tasks_reason"] = _tasks_reason
+    # 签到执行体单独留引用：/admin/checkin 沿用旧的结构与语义（排程由 tasks 负责）
+    scheduler = tasks.checkin_runner if tasks is not None else None
+    CONFIG["checkin"] = scheduler
+    if not tasks or not tasks.enabled["checkin"]:
+        CONFIG["checkin_reason"] = (
+            _tasks_reason or "自动签到未启用（--no-checkin）"
+        )
+    else:
+        CONFIG["checkin_reason"] = ""
+
     if not args.skip_check:
         preflight()
 
     sys.stderr.write(
         f"\n✅ 监听 http://{args.host}:{args.port}（直连后端，原生 function calling）\n"
     )
-    sys.stderr.write("   GET  /v1/models\n")
+    sys.stderr.write("   GET  /v1/models              (动态拉取，?refresh=1 强制重拉)\n")
     sys.stderr.write(
         "   POST /v1/chat/completions   (原生 tools/tool_calls，支持流式)\n"
     )
@@ -1526,11 +1924,33 @@ def main():
     sys.stderr.write(
         "   POST /v1/messages           (Anthropic API，Claude Code / CC Switch 兼容)\n"
     )
+    sys.stderr.write("   GET  /admin/models          (模型缓存状态)\n")
+    sys.stderr.write("   GET  /admin/checkin         (签到状态 / POST 立即签到)\n")
+    sys.stderr.write(
+        "   GET  /admin/tasks           (六类定时任务状态 / POST ?task=all|travel 立即执行)\n"
+    )
     sys.stderr.write("   GET  /health\n")
     if args.api_key:
         sys.stderr.write("   鉴权已启用（API key 已设置）\n")
     if CONFIG["log_path"]:
         sys.stderr.write(f"   日志      : {CONFIG['log_path']}\n")
+    if registry.enabled:
+        sys.stderr.write(
+            f"   缓存目录  : {registry.cache_dir}（模型快照 + 签到留档 + 任务留档）\n"
+        )
+    if tasks is not None:
+        for key in TASK_KEYS:
+            st = tasks.task_status(key)
+            if not st["enabled"]:
+                continue
+            line = f"   {_pad_label(TASK_LABELS[key])}: " + "、".join(
+                f"{h:02d}:00" for h in st["hours"]
+            )
+            if key == "checkin" and args.checkin_on_start:
+                line += "（启动时先跑一次）"
+            sys.stderr.write(line + "\n")
+    elif _tasks_reason:
+        sys.stderr.write(f"   定时任务  : {_tasks_reason}\n")
     if args.desensitize:
         mode = "零宽脱敏 + 保留全文" if args.no_compact else "零宽脱敏 + 压缩摘要"
         sys.stderr.write(f"   脱敏      : 已启用（{mode}）\n")
@@ -1539,7 +1959,23 @@ def main():
     # 启动时写一条标记
     _log("==== converter 启动 ====")
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    # 启动预热：把模型快照提前装进内存（失败不影响服务）
+    if registry.enabled:
+        threading.Thread(
+            target=registry.warm,
+            args=(_safe_cred_headers(),),
+            name="models-warm",
+            daemon=True,
+        ).start()
+
+    if tasks is not None:
+        tasks.start()
+
+    try:
+        uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    finally:
+        if tasks is not None:
+            tasks.stop()
 
 
 if __name__ == "__main__":

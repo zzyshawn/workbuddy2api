@@ -1,0 +1,29 @@
+# 【安全】登录态绝不进镜像：桌面端凭据导出物（workbuddy-desktop.info 等）
+auth/
+auths/
+*.info
+*.token
+*.key
+secrets.*
+
+# 本地运行产物
+data/
+converter-logs/
+__pycache__/
+*.tmp
+*.log
+.git/
+.gitignore
+docs/
+scripts/
+# 根目录已提交/未提交的二进制产物不进构建上下文（与 .gitignore 对齐）
+/login
+/credit
+/wb2api
+/signin_bin
+# 真实配置不进镜像（镜像默认用 config.example.json，生产以挂载卷覆盖）
+config.json
+PLAN.md
+SPEC.md
+LOOP.md
+README.md

@@ -17,8 +17,23 @@ ENV/
 .DS_Store
 Thumbs.db
 
+# 动态模型快照 + 签到留档（--cache-dir ./cache 时生成）
+cache/
+converter-logs/
+data/
+
 # 个人 / 敏感信息（绝不提交）
+auth/
+auths/
+*.info
 *.token
 *.key
 secrets.*
+
+# 真实配置不进仓库（仓库只留 config.example.json）
+config.json
+
+# IDE / 助手工作区
+.idea/
+.workbuddy/
 

@@ -1,0 +1,12 @@
+# 统一换行符：容器内是 Linux，CRLF 会导致 shell 脚本与 entrypoint 执行失败
+* text=auto eol=lf
+
+# 明确二进制，避免被当文本转换
+*.png binary
+*.jpg binary
+*.ico binary
+*.zip binary
+*.gz binary
+
+# 这些文件在 Windows 上生成，保持原样
+*.bat text eol=crlf

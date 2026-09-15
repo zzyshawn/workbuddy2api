@@ -1,0 +1,93 @@
+# WorkBuddy / CodeBuddy 登录态 -> OpenAI / Anthropic 兼容 API
+# 上游: https://github.com/ShouZhuo0413/codebuddy2api
+#
+# 使用前：把仓库克隆到本文件同级目录
+#   git clone https://github.com/ShouZhuo0413/codebuddy2api.git .
+#
+# 启动：
+#   docker-compose up -d --build
+# 验证：
+#   curl http://127.0.0.1:8787/health
+#   curl http://<你的NAS地址>:8787/v1/models
+# 日志：
+#   docker-compose logs -f
+#   docker-compose exec workbuddy2api tail -f /logs/converter.log
+
+services:
+  workbuddy2api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # 不想手动 clone 的话，可以把上面两行换成下面这行（Compose v2+ 支持 git 作为构建上下文）：
+      #context: https://github.com/ShouZhuo0413/codebuddy2api.git#main
+    image: workbuddy2api:latest
+    container_name: workbuddy2api
+
+    ports:
+      # 只监听本机回环，避免无鉴权接口暴露到局域网。
+      # 需要局域网其他设备访问时改成 "0.0.0.0:8787:8787"，并务必设置 CODEBUDDY2OPENAI_KEY。
+      - "8787:8787"
+
+    volumes:
+      # 【必须可写，不要加 :ro】
+      # converter.py 在 token 临近过期时会用 os.replace() 原子回写 auth 文件
+      # （见 CredentialManager._refresh）。只读挂载会导致刷新失败 -> 后端 401。
+      # 另外要挂「目录」而不是单个 .info 文件，否则容器内 rename 会报 busy。
+      #
+      # ★ 部署前把 ./your-path 改成你自己的宿主机目录（下面两行都要改）。
+      #   容器内路径 /data/auth、/logs 不要动，与 CODEBUDDY_AUTH_DIR / --log 对应。
+      - "./your-path/auth:/data/auth"
+      - "./your-path/logs:/logs"
+
+      # 宿主机凭据目录参考位置（复制 workbuddy-desktop.info 过去即可）：
+      #   macOS : ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth
+      #   Linux : ~/.local/share/CodeBuddyExtension/Data/Public/auth
+      #   Windows: %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth
+
+    environment:
+      # 指定容器内的登录态目录（container 里没有桌面端默认路径）
+      - CODEBUDDY_AUTH_DIR=/data/auth
+      # 可选：给本地 API 加一层鉴权。留空 = 不校验（配合回环端口绑定即可）
+      - CODEBUDDY2OPENAI_KEY=
+      # 等价于 --log，也可由下面的 command 指定
+      - CODEBUDDY2OPENAI_LOG=/logs/converter.log
+      - PYTHONUNBUFFERED=1
+      # 【六类定时任务按容器时区判定整点】务必留 Asia/Shanghai，
+      # 否则 09:00 签到会按 UTC（17:00）触发。夜猫窗口 23:00–08:00 同理。
+      - TZ=Asia/Shanghai
+      # 六类任务时点与开关（缺省即默认值，按需打开注释改写）：
+      # - CODEBUDDY2OPENAI_CHECKIN_HOURS=9,21       # 签到
+      # - CODEBUDDY2OPENAI_TRAVEL_HOURS=9,21        # 猫猫旅行
+      # - CODEBUDDY2OPENAI_ACTIVITY_HOURS=10        # 活跃上报
+      # - CODEBUDDY2OPENAI_KEEPALIVE_HOURS=22       # token 保活
+      # - CODEBUDDY2OPENAI_SCHOOL_HOURS=12          # 开学季任务
+      # - CODEBUDDY2OPENAI_CAT_HOURS=1              # 夜猫子任务
+      # - CODEBUDDY2OPENAI_ACTIVITY_REPORT_COUNT=5  # 每次活跃上报条数
+
+    # 覆盖 Dockerfile 的默认 CMD：打开脱敏与日志，去掉 --skip-check 以便打印预检信息
+    command:
+      - python3
+      - converter.py
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8787"
+      - --desensitize
+      - --log
+      - /logs/converter.log
+
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=3).status==200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+    restart: unless-stopped
+
+volumes:
+  converter-logs:
