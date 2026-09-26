@@ -16,12 +16,20 @@ import os
 import time
 from typing import Any
 
+import reasoning
+
 # ---------------------------------------------------------------------------
 # ID 生成
 # ---------------------------------------------------------------------------
 
 def _rand_id(prefix: str = "") -> str:
     return prefix + os.urandom(12).hex()
+
+
+#: 客户端没带 system 时兜底用的系统提示。
+#: 内容刻意做成中性、短小 —— 它只是为了满足国际版「首条必须是 system」的硬约束，
+#: 不是要注入行为。真正有意义的 system prompt 由客户端自己传。
+FALLBACK_SYSTEM_PROMPT = "You are a helpful assistant."
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +43,8 @@ def anthropic_request_to_chat(body: dict) -> dict:
       system → messages[0] role=system
       messages[].content (blocks) → content (string) / tool_calls / tool role
       tools[].input_schema → tools[].function.parameters
-      metadata / thinking → 丢弃
+      metadata → 丢弃
+      thinking.budget_tokens → reasoning_effort（分段映射档位，见 reasoning.py）
     """
     messages: list[dict] = []
 
@@ -79,7 +88,37 @@ def anthropic_request_to_chat(body: dict) -> dict:
         if key in body:
             chat[key] = body[key]
 
+    # 思考强度：Claude Code 用 `thinking = {type:"enabled", budget_tokens: N}` 表达，
+    # 与 CodeBuddy 的「档位」模型不同构 —— 上游只有 6 档、没有连续预算，
+    # 所以按预算分段映射到最接近的档位。budget_tokens 本身无法透传。
+    # 关闭语义（type=disabled / enabled=false）返回空 spec，此时不发任何字段。
+    spec = reasoning.resolve(
+        reasoning.from_anthropic_thinking(
+            body.get("thinking"), body.get("reasoning_effort")
+        )
+    )
+    chat.update(reasoning.to_openai_fields(spec))
+
+    # 国际版（www.codebuddy.ai）硬性要求首条消息必须是 system prompt，
+    # 否则直接 400 + code 11128「first message is not system prompt」。
+    # 客户端完全不带 `system` 字段时上面那段不会命中，这里必须兜底 ——
+    # 与 responses_projection 的 _ensure_leading_system 是同一份契约。
+    _ensure_leading_system(chat)
+
     return chat
+
+
+def _ensure_leading_system(chat: dict) -> bool:
+    """确保 chat["messages"] 首条是 system。已满足返回 False，补了一条返回 True。"""
+    messages = chat.get("messages")
+    if not isinstance(messages, list):
+        return False
+    if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+        return False
+    chat["messages"] = [
+        {"role": "system", "content": FALLBACK_SYSTEM_PROMPT}
+    ] + messages
+    return True
 
 
 def _extract_system_text(system) -> str:
@@ -229,6 +268,13 @@ class AnthropicStreamConverter:
         self._text_block_open = False
         self._text_block_idx = 0
 
+        # 思考内容块（上游 delta.reasoning_content）。
+        # Claude Code 用 `thinking` 块展示思考过程；不透出的话用户看不到
+        # 思考过程，也无从判断 thinking.budget_tokens 映射出的档位有没有生效。
+        self._thinking_content = ""
+        self._thinking_block_open = False
+        self._thinking_block_idx = 0
+
         # tool_use 内容块（index → {id, name, args, block_idx, open}）
         self._tool_uses: dict[int, dict] = {}
         self._next_block_idx = 0
@@ -257,6 +303,13 @@ class AnthropicStreamConverter:
     def finish(self) -> str:
         """流结束，发出收尾事件。"""
         events: list[str] = []
+
+        # 关闭 thinking 块（若正文一直没出现，思考块可能仍开着）
+        if self._thinking_block_open:
+            events.append(self._evt(
+                "content_block_stop", {"index": self._thinking_block_idx}
+            ))
+            self._thinking_block_open = False
 
         # 关闭 text 块
         if self._text_block_open:
@@ -354,9 +407,32 @@ class AnthropicStreamConverter:
             delta = choice.get("delta", {})
             finish = choice.get("finish_reason")
 
+            # thinking delta（思考过程）—— 上游在 content 之前流 reasoning_content
+            reasoning_piece = delta.get("reasoning_content")
+            if reasoning_piece:
+                if not self._thinking_block_open:
+                    self._thinking_block_idx = self._next_block_idx
+                    self._next_block_idx += 1
+                    events.append(self._evt("content_block_start", {
+                        "index": self._thinking_block_idx,
+                        "content_block": {"type": "thinking", "thinking": ""},
+                    }))
+                    self._thinking_block_open = True
+                self._thinking_content += reasoning_piece
+                events.append(self._evt("content_block_delta", {
+                    "index": self._thinking_block_idx,
+                    "delta": {"type": "thinking_delta", "thinking": reasoning_piece},
+                }))
+
             # content delta
             content = delta.get("content")
             if content:
+                # 正文开始前先收尾思考块（Anthropic 里 thinking 必须在 text 之前闭合）
+                if self._thinking_block_open:
+                    events.append(self._evt("content_block_stop", {
+                        "index": self._thinking_block_idx
+                    }))
+                    self._thinking_block_open = False
                 self._text_content += content
                 if not self._text_block_open:
                     self._text_block_idx = self._next_block_idx
@@ -432,6 +508,10 @@ class AnthropicStreamConverter:
     def _build_content_blocks(self) -> list[dict]:
         """构造完整的 content blocks 数组（用于非流式响应）。"""
         blocks: list[dict] = []
+
+        # thinking block（必须在 text 之前，与流式的块顺序一致）
+        if self._thinking_content or self._thinking_block_open:
+            blocks.append({"type": "thinking", "thinking": self._thinking_content})
 
         # text block
         if self._text_content or self._text_block_open:

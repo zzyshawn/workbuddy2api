@@ -53,11 +53,15 @@ class TravelRunner:
         timeout: float = DEFAULT_TIMEOUT,
         transport: object | None = None,
         log: Callable[[str], None] | None = None,
+        env: str | None = None,
+        proxy: str | None = None,
     ):
         self.cred = cred
         self.location_id = int(location_id)
         self.timeout = float(timeout)
         self.transport = transport
+        self.env = env
+        self.proxy = proxy
         self._log = log or (lambda _m: None)
 
         self._lock = threading.Lock()
@@ -88,7 +92,7 @@ class TravelRunner:
             if err:
                 return TaskOutcome(KEY, False, err)
         with self._lock:
-            buddy = growth_api.fetch_buddy(acct, timeout=self.timeout, transport=self.transport)
+            buddy = growth_api.fetch_buddy(acct, timeout=self.timeout, transport=self.transport, env=self.env, proxy=self.proxy, )
             if not buddy.ok:
                 return self._store(
                     TaskOutcome(KEY, False, f"查猫档案失败：{buddy.summary()}", {"reason": reason})
@@ -133,7 +137,7 @@ class TravelRunner:
         steps: list[dict] = []
         detail: dict = {"reason": reason, "uid": acct.uid, "steps": steps}
 
-        buddy = growth_api.fetch_buddy(acct, timeout=self.timeout, transport=self.transport)
+        buddy = growth_api.fetch_buddy(acct, timeout=self.timeout, transport=self.transport, env=self.env, proxy=self.proxy, )
         if not buddy.ok:
             return TaskOutcome(KEY, False, f"查猫档案失败：{buddy.summary()}", detail)
         if buddy.data is None:
@@ -143,7 +147,7 @@ class TravelRunner:
             return TaskOutcome(KEY, ok, summary, detail)
 
         detail["buddy"] = {"id": buddy.data.get("id"), "name": buddy.data.get("name")}
-        st = growth_api.fetch_travel_status(acct, timeout=self.timeout, transport=self.transport)
+        st = growth_api.fetch_travel_status(acct, timeout=self.timeout, transport=self.transport, env=self.env, proxy=self.proxy, )
         if not st.ok:
             return TaskOutcome(KEY, False, f"查旅行状态失败：{st.summary()}", detail)
 
@@ -167,7 +171,12 @@ class TravelRunner:
             detail["action"] = "skip"
             return TaskOutcome(KEY, True, "今日已派出过（自然日 00:00 CST 重置），跳过", detail)
         res = growth_api.travel_depart(
-            acct, self.location_id, timeout=self.timeout, transport=self.transport
+            acct,
+            self.location_id,
+            timeout=self.timeout,
+            transport=self.transport,
+            env=self.env,
+            proxy=self.proxy,
         )
         detail["action"] = "depart"
         detail["location_id"] = self.location_id
@@ -182,7 +191,12 @@ class TravelRunner:
             detail["action"] = "skip"
             return TaskOutcome(KEY, True, "已到站但缺 record_id，跳过领奖", detail)
         res = growth_api.travel_claim(
-            acct, record_id, timeout=self.timeout, transport=self.transport
+            acct,
+            record_id,
+            timeout=self.timeout,
+            transport=self.transport,
+            env=self.env,
+            proxy=self.proxy,
         )
         detail["action"] = "claim"
         detail["record_id"] = record_id
@@ -196,10 +210,10 @@ class TravelRunner:
         uid = acct.uid
         if not force and self._adopt_tried.get(uid) == growth_api.cst_day():
             return True, "今日已试过领养（对话量未达门槛），当日不再重试", {"adopt": "debounced"}
-        ag = growth_api.buddy_agreement(acct, timeout=self.timeout, transport=self.transport)
+        ag = growth_api.buddy_agreement(acct, timeout=self.timeout, transport=self.transport, env=self.env, proxy=self.proxy, )
         if not ag.ok:
             return False, f"同意协议失败：{ag.summary()}", {"adopt": "agreement_failed"}
-        first = growth_api.buddy_first(acct, timeout=self.timeout, transport=self.transport)
+        first = growth_api.buddy_first(acct, timeout=self.timeout, transport=self.transport, env=self.env, proxy=self.proxy, )
         if first.ok:
             return True, "领养成功（+300 积分）", {"adopt": "ok"}
         if growth_api.is_buddy_task_incomplete(first):

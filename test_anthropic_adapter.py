@@ -12,6 +12,8 @@ sys.path.insert(0, ".")
 from anthropic_adapter import (
     anthropic_request_to_chat,
     AnthropicStreamConverter,
+    FALLBACK_SYSTEM_PROMPT,
+    _ensure_leading_system,
 )
 
 
@@ -49,6 +51,40 @@ def test_system_array():
     chat = anthropic_request_to_chat(req)
     assert chat["messages"][0]["content"] == "You are helpful.\nBe concise."
     print("✅ test_system_array")
+
+
+def test_missing_system_gets_fallback():
+    """关键用例：客户端不带 system 时也要兜出一条 system 消息。
+
+    国际版（www.codebuddy.ai）硬性要求首条消息必须是 system prompt，
+    否则 400 + code 11128「first message is not system prompt」，
+    且它的 displayMsg 文案是误导性的「blocked by security policy」。
+    Claude Code 在部分场景下不带 `system` 字段，所以这条兜底是必需的。
+    """
+    req = {"model": "glm-5.2", "messages": [{"role": "user", "content": "hi"}]}
+    chat = anthropic_request_to_chat(req)
+    msgs = chat["messages"]
+
+    assert msgs[0]["role"] == "system", f"首条必须是 system，实际 {msgs[0]['role']}"
+    assert msgs[0]["content"] == FALLBACK_SYSTEM_PROMPT
+    assert msgs[1] == {"role": "user", "content": "hi"}
+
+    # 客户端自带 system 时必须让位，不能被兜底顶掉，也不能插两条
+    req2 = {
+        "model": "glm-5.2",
+        "system": "You are Claude Code",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    msgs2 = anthropic_request_to_chat(req2)["messages"]
+    assert msgs2[0]["content"] == "You are Claude Code"
+    assert len([m for m in msgs2 if m["role"] == "system"]) == 1
+
+    # 幂等：重复调用不应叠加插入
+    probe = {"messages": [{"role": "user", "content": "x"}]}
+    assert _ensure_leading_system(probe) is True
+    assert _ensure_leading_system(probe) is False
+    assert len(probe["messages"]) == 2
+    print("✅ test_missing_system_gets_fallback")
 
 
 def test_text_and_tool_use():
@@ -110,11 +146,13 @@ def test_tool_only_no_text():
     chat = anthropic_request_to_chat(req)
     msgs = chat["messages"]
 
-    assert msgs[0]["role"] == "user"
-    assert msgs[1]["role"] == "assistant"
-    assert msgs[1]["content"] is None
-    assert len(msgs[1]["tool_calls"]) == 1
-    assert msgs[1]["tool_calls"][0]["id"] == "toolu_123"
+    # 首条是兜底 system（客户端未传 system），所以真实消息从 index 1 开始
+    assert msgs[0]["role"] == "system"
+    assert msgs[1]["role"] == "user"
+    assert msgs[2]["role"] == "assistant"
+    assert msgs[2]["content"] is None
+    assert len(msgs[2]["tool_calls"]) == 1
+    assert msgs[2]["tool_calls"][0]["id"] == "toolu_123"
     print("✅ test_tool_only_no_text")
 
 
@@ -151,11 +189,13 @@ def test_tool_result():
     chat = anthropic_request_to_chat(req)
     msgs = chat["messages"]
 
-    assert msgs[0]["role"] == "user"
-    assert msgs[1]["role"] == "assistant"
-    assert msgs[2]["role"] == "tool"
-    assert msgs[2]["tool_call_id"] == "toolu_abc"
-    assert msgs[2]["content"] == "file1.txt\nfile2.txt"
+    # 首条是兜底 system，真实消息整体后移一位
+    assert msgs[0]["role"] == "system"
+    assert msgs[1]["role"] == "user"
+    assert msgs[2]["role"] == "assistant"
+    assert msgs[3]["role"] == "tool"
+    assert msgs[3]["tool_call_id"] == "toolu_abc"
+    assert msgs[3]["content"] == "file1.txt\nfile2.txt"
     print("✅ test_tool_result")
 
 
@@ -181,10 +221,11 @@ def test_tool_result_with_user_text():
     chat = anthropic_request_to_chat(req)
     msgs = chat["messages"]
 
-    assert msgs[0]["role"] == "user"
-    assert msgs[0]["content"] == "Continue."
-    assert msgs[1]["role"] == "tool"
-    assert msgs[1]["tool_call_id"] == "toolu_xyz"
+    assert msgs[0]["role"] == "system"
+    assert msgs[1]["role"] == "user"
+    assert msgs[1]["content"] == "Continue."
+    assert msgs[2]["role"] == "tool"
+    assert msgs[2]["tool_call_id"] == "toolu_xyz"
     print("✅ test_tool_result_with_user_text")
 
 
@@ -226,8 +267,9 @@ def test_string_content():
         ],
     }
     chat = anthropic_request_to_chat(req)
-    assert chat["messages"][0] == {"role": "user", "content": "Hello"}
-    assert chat["messages"][1] == {"role": "assistant", "content": "Hi there"}
+    assert chat["messages"][0]["role"] == "system"
+    assert chat["messages"][1] == {"role": "user", "content": "Hello"}
+    assert chat["messages"][2] == {"role": "assistant", "content": "Hi there"}
     print("✅ test_string_content")
 
 
@@ -408,6 +450,7 @@ def test_empty_messages():
 if __name__ == "__main__":
     test_simple_text_request()
     test_system_array()
+    test_missing_system_gets_fallback()
     test_text_and_tool_use()
     test_tool_only_no_text()
     test_tool_result()
@@ -419,4 +462,4 @@ if __name__ == "__main__":
     test_nonstream_response()
     test_nonstream_response_tool_use()
     test_empty_messages()
-    print(f"\n🎉 All {13} tests passed!")
+    print(f"\n🎉 All {14} tests passed!")

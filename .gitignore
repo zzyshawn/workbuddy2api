@@ -22,6 +22,12 @@ cache/
 converter-logs/
 data/
 
+# 抓包留档（/v3/config 原始响应等，含 uid / 企业信息，绝不入库）
+debug/
+
+# 部署包产物（由 pack_for_nas.py 生成，不入库）
+wb2api*.tar.gz
+
 # 个人 / 敏感信息（绝不提交）
 auth/
 auths/

@@ -1,6 +1,8 @@
 # 【安全】登录态绝不进镜像：桌面端凭据导出物（workbuddy-desktop.info 等）
 auth/
 auths/
+cn/
+intl/
 *.info
 *.token
 *.key
@@ -8,10 +10,16 @@ secrets.*
 
 # 本地运行产物
 data/
+logs/
 converter-logs/
 __pycache__/
+*.py[cod]
 *.tmp
 *.log
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
 .git/
 .gitignore
 docs/
@@ -27,3 +35,9 @@ PLAN.md
 SPEC.md
 LOOP.md
 README.md
+# 测试文件不进镜像（镜像只需要运行时模块）
+test_*.py
+_*.py
+# 模型快照缓存由卷提供，不进镜像
+cache/
+models-snapshot.json

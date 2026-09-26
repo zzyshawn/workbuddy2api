@@ -38,11 +38,16 @@ import growth_api
 from growth_api import DEFAULT_TIMEOUT
 from task_result import TaskOutcome
 
+import environments
+
 KEY = "school"
 
 DEFAULT_SCHOOL_HOURS: tuple[int, ...] = (12,)
 
-SCHOOL_BASE = "https://www.codebuddy.cn"
+#: 开学季活动域：国内版 www.codebuddy.cn。这是**国内专属活动**，
+#: 国际版大概率没有（见 docs-environments-design.md 的 R4）——活动下线时
+#: in_period=false 会自动跳过，不报失败。
+SCHOOL_BASE = environments.base_for("billing")
 SCHOOL_PREFIX = "/portal/activity/school"
 #: 活动标识：事件必须带 activityId，否则服务端不把事件关联到活动任务。
 ACTIVITY_ID = "school_open_day_2026"
@@ -147,6 +152,8 @@ def _call(
     headers: dict | None = None,
     timeout: float = DEFAULT_TIMEOUT,
     transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
     log: Callable[[str], None] | None = None,
 ) -> growth_api.ApiResult:
     """活动接口调用：网络失败与 5xx 按 RETRY_GAP 退避重试 RETRIES 次，其余直接返回。"""
@@ -160,6 +167,8 @@ def _call(
             body=body,
             timeout=timeout,
             transport=transport,
+            env=env,
+            proxy=proxy,
         )
         if res.status == -1 or 500 <= res.status < 600:
             last = res
@@ -195,10 +204,12 @@ def fetch_school_tasks(
     *,
     timeout: float = DEFAULT_TIMEOUT,
     transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
     log: Callable[[str], None] | None = None,
 ) -> tuple[list[dict], bool, growth_api.ApiResult]:
     """拉活动任务列表。返回 (tasks, in_period, ApiResult)。"""
-    res = _call(acct, "GET", PATH_TASKS, timeout=timeout, transport=transport, log=log)
+    res = _call(acct, "GET", PATH_TASKS, timeout=timeout, transport=transport, env=env, proxy=proxy, log=log)
     if not res.ok:
         return [], False, res
     data = res.data if isinstance(res.data, dict) else {}
@@ -211,10 +222,12 @@ def fetch_lottery_config(
     *,
     timeout: float = DEFAULT_TIMEOUT,
     transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
     log: Callable[[str], None] | None = None,
 ) -> tuple[dict, dict, growth_api.ApiResult]:
     """查抽奖盘面与余额。返回 (config, chance, ApiResult)；chance.balance 即抽奖次数。"""
-    res = _call(acct, "GET", PATH_CONFIG, timeout=timeout, transport=transport, log=log)
+    res = _call(acct, "GET", PATH_CONFIG, timeout=timeout, transport=transport, env=env, proxy=proxy, log=log)
     if not res.ok:
         return {}, {}, res
     data = res.data if isinstance(res.data, dict) else {}
@@ -232,11 +245,13 @@ def post_viewed(
     *,
     timeout: float = DEFAULT_TIMEOUT,
     transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
     log: Callable[[str], None] | None = None,
 ) -> growth_api.ApiResult:
     """接任务（pending → in_progress）。"""
     return _call(
-        acct, "POST", PATH_VIEWED_FMT.format(code=code), timeout=timeout, transport=transport, log=log
+        acct, "POST", PATH_VIEWED_FMT.format(code=code), timeout=timeout, transport=transport, env=env, proxy=proxy, log=log
     )
 
 
@@ -245,6 +260,8 @@ def post_share_complete(
     *,
     timeout: float = DEFAULT_TIMEOUT,
     transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
     log: Callable[[str], None] | None = None,
 ) -> growth_api.ApiResult:
     """share_invite 的完成判据。"""
@@ -255,6 +272,8 @@ def post_share_complete(
         {"channel": "wechat"},
         timeout=timeout,
         transport=transport,
+        env=env,
+        proxy=proxy,
         log=log,
     )
 
@@ -265,11 +284,13 @@ def post_claim(
     *,
     timeout: float = DEFAULT_TIMEOUT,
     transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
     log: Callable[[str], None] | None = None,
 ) -> growth_api.ApiResult:
     """领奖（completed → claimed，会发抽奖机会）。"""
     return _call(
-        acct, "POST", PATH_CLAIM_FMT.format(code=code), timeout=timeout, transport=transport, log=log
+        acct, "POST", PATH_CLAIM_FMT.format(code=code), timeout=timeout, transport=transport, env=env, proxy=proxy, log=log
     )
 
 
@@ -455,6 +476,8 @@ def fetch_school_expert(
     *,
     timeout: float = DEFAULT_TIMEOUT,
     transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
     log: Callable[[str], None] | None = None,
 ) -> tuple[str, str, str]:
     """拉一个 BackToSchool 分类的真实开学季专家；失败回落已知专家。"""
@@ -474,6 +497,8 @@ def fetch_school_expert(
         body,
         timeout=timeout,
         transport=transport,
+        env=env,
+        proxy=proxy,
         log=log,
     )
     experts = (res.data or {}).get("experts") if (res.ok and isinstance(res.data, dict)) else None
@@ -499,6 +524,8 @@ def build_report_events(
     *,
     timeout: float = DEFAULT_TIMEOUT,
     transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
     log: Callable[[str], None] | None = None,
 ) -> tuple[list[dict], str, dict | None]:
     """按 report_kind 构造事件数组。返回 (events, base_url, extra_headers)。
@@ -510,7 +537,7 @@ def build_report_events(
         return [_mini_chat_event(acct, f"wbmp-{now}")], SCHOOL_BASE, None
     if kind == "expert":
         eid, name, _prof = fetch_school_expert(
-            acct, timeout=timeout, transport=transport, log=log
+            acct, timeout=timeout, transport=transport, env=env, proxy=proxy, log=log
         )
         return [_expert_event(acct, eid, name, f"wbexp-{now}")], SCHOOL_BASE, None
     if kind == "desktop_seq":
@@ -535,6 +562,8 @@ def report_events(
     extra_headers: dict | None = None,
     timeout: float = DEFAULT_TIMEOUT,
     transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
     log: Callable[[str], None] | None = None,
 ) -> growth_api.ApiResult:
     """把事件数组发到指定域。"""
@@ -548,6 +577,8 @@ def report_events(
         headers=headers,
         timeout=timeout,
         transport=transport,
+        env=env,
+        proxy=proxy,
         log=log,
     )
 
@@ -573,6 +604,8 @@ def draw_once(
     *,
     timeout: float = DEFAULT_TIMEOUT,
     transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
     log: Callable[[str], None] | None = None,
 ) -> growth_api.ApiResult:
     """抽一次转盘（draw_uuid 每轮一次性，抽后即弃）。"""
@@ -583,6 +616,8 @@ def draw_once(
         {"draw_uuid": draw_uuid},
         timeout=timeout,
         transport=transport,
+        env=env,
+        proxy=proxy,
         log=log,
     )
 
@@ -602,12 +637,16 @@ class SchoolRunner:
         gap: float = DEFAULT_GAP,
         timeout: float = DEFAULT_TIMEOUT,
         transport: object | None = None,
+        env: str | None = None,
+        proxy: str | None = None,
         log: Callable[[str], None] | None = None,
     ):
         self.cred = cred
         self.gap = max(MIN_GAP, float(gap))
         self.timeout = float(timeout)
         self.transport = transport
+        self.env = env
+        self.proxy = proxy
         self._log = log or (lambda _m: None)
 
         self._lock = threading.Lock()
@@ -655,7 +694,7 @@ class SchoolRunner:
         detail: dict = {"reason": reason, "uid": acct.uid, "counters": counters, "steps": []}
 
         tasks, in_period, res = fetch_school_tasks(
-            acct, timeout=self.timeout, transport=self.transport, log=self._log
+            acct, timeout=self.timeout, transport=self.transport, env=self.env, proxy=self.proxy, log=self._log
         )
         if not res.ok:
             counters["fail"] += 1
@@ -714,7 +753,7 @@ class SchoolRunner:
 
         # 1) pending → viewed 激活（接单，H5 行为）
         if status == "pending":
-            r = post_viewed(acct, code, timeout=self.timeout, transport=self.transport, log=self._log)
+            r = post_viewed(acct, code, timeout=self.timeout, transport=self.transport, env=self.env, proxy=self.proxy, log=self._log)
             step["viewed"] = {"ok": r.ok, "status": r.status, "code": r.code}
             if not r.ok:
                 counters["fail"] += 1
@@ -737,7 +776,7 @@ class SchoolRunner:
         for i in range(rounds):
             if mode == "share":
                 r = post_share_complete(
-                    acct, timeout=self.timeout, transport=self.transport, log=self._log
+                    acct, timeout=self.timeout, transport=self.transport, env=self.env, proxy=self.proxy, log=self._log
                 )
             else:
                 events, base_url, extra = build_report_events(
@@ -745,6 +784,8 @@ class SchoolRunner:
                     spec.get("report_kind"),
                     timeout=self.timeout,
                     transport=self.transport,
+                    env=self.env,
+                    proxy=self.proxy,
                     log=self._log,
                 )
                 r = report_events(
@@ -754,6 +795,8 @@ class SchoolRunner:
                     extra_headers=extra,
                     timeout=self.timeout,
                     transport=self.transport,
+                    env=self.env,
+                    proxy=self.proxy,
                     log=self._log,
                 )
             triggers.append({"round": i + 1, "ok": r.ok, "status": r.status, "code": r.code})
@@ -791,7 +834,7 @@ class SchoolRunner:
 
         # 4) completed → claim 领奖（发抽奖机会）
         if after == "completed":
-            rc = post_claim(acct, code, timeout=self.timeout, transport=self.transport, log=self._log)
+            rc = post_claim(acct, code, timeout=self.timeout, transport=self.transport, env=self.env, proxy=self.proxy, log=self._log)
             step["claim"] = {"ok": rc.ok, "status": rc.status, "code": rc.code}
             if not rc.ok:
                 counters["fail"] += 1
@@ -801,7 +844,7 @@ class SchoolRunner:
 
     def _refetch(self, acct: growth_api.Account, code: str) -> dict | None:
         tasks, _in_period, _res = fetch_school_tasks(
-            acct, timeout=self.timeout, transport=self.transport, log=self._log
+            acct, timeout=self.timeout, transport=self.transport, env=self.env, proxy=self.proxy, log=self._log
         )
         for t in tasks:
             if t.get("task_code") == code:
@@ -811,7 +854,7 @@ class SchoolRunner:
     def _lottery(self, acct: growth_api.Account) -> dict:
         """抽奖段：查余额 → 抽到空/异常 → 汇总。活动非进行期或余额 0 直接返回。"""
         cfg, chance, res = fetch_lottery_config(
-            acct, timeout=self.timeout, transport=self.transport, log=self._log
+            acct, timeout=self.timeout, transport=self.transport, env=self.env, proxy=self.proxy, log=self._log
         )
         if not res.ok:
             return {"ok": False, "error": res.summary()}
@@ -832,6 +875,8 @@ class SchoolRunner:
                 str(uuidlib.uuid4()),
                 timeout=self.timeout,
                 transport=self.transport,
+                env=self.env,
+                proxy=self.proxy,
                 log=self._log,
             )
             if not r.ok:

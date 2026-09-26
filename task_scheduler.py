@@ -85,6 +85,10 @@ class TaskConfig:
     school_gap: float = school.DEFAULT_GAP
     travel_location_id: int = 4
     timeout: float = 60.0
+    #: 环境与代理（None = 走 environments 的默认链：环境变量 → 凭据域 → 兜底）。
+    #: 集中在这里，由 _build_runners 统一注入六类执行体。
+    env: str | None = None
+    proxy: str | None = None
 
 
 _HOURS_FIELD = {
@@ -127,6 +131,7 @@ class TaskScheduler(threading.Thread):
         transport: object | None = None,
         runners: dict | None = None,
         log: Callable[[str], None] | None = None,
+        on_result: Callable[[str, dict], None] | None = None,
     ):
         super().__init__(name="task-scheduler", daemon=True)
         self.cred = cred
@@ -136,6 +141,10 @@ class TaskScheduler(threading.Thread):
         self.run_on_start = tuple(run_on_start or ())
         self.transport = transport
         self._log = log or (lambda _m: None)
+        #: 每跑完一类任务回调一次（key, 结果字典）。装配处用它来刷新状态快照。
+        #: 做成回调而不是让调度器直接依赖快照模块 —— 保持「任务模块不 import 观测模块」
+        #: 的依赖方向，跨模块的写入由装配处（converter.main）注入。
+        self._on_result = on_result
 
         self.hours: dict[str, tuple[int, ...]] = {
             k: normalize_hours(getattr(self.cfg, _HOURS_FIELD[k]), _DEFAULT_HOURS[k])
@@ -163,7 +172,11 @@ class TaskScheduler(threading.Thread):
 
         activity 需要「补满对话量后重试领养」，这个动作属于 travel（旅行状态机），
         但 activity 不该 import travel——所以在装配处注入回调（依赖方向单向）。
+
+        env / proxy 同样在**装配处**统一注入：六类任务各自独立成模块、互不 import，
+        让它们各自去读环境变量会让「换环境」散落六处；集中在这里注入只改一个地方。
         """
+        env, proxy = self.cfg.env, self.cfg.proxy
         runners: dict = {}
         if self.enabled["checkin"] and self.cred is not None:
             runners["checkin"] = CheckinScheduler(
@@ -173,6 +186,8 @@ class TaskScheduler(threading.Thread):
                 timeout=self.cfg.timeout,
                 cache_dir=self.cache_dir,
                 log=self._log,
+                env=env,
+                proxy=proxy,
             )
 
         travel_runner = None
@@ -183,6 +198,8 @@ class TaskScheduler(threading.Thread):
                 timeout=self.cfg.timeout,
                 transport=self.transport,
                 log=self._log,
+                env=env,
+                proxy=proxy,
             )
             runners["travel"] = travel_runner
 
@@ -195,11 +212,13 @@ class TaskScheduler(threading.Thread):
                 transport=self.transport,
                 log=self._log,
                 adopt=travel_runner.adopt_force if travel_runner is not None else None,
+                env=env,
+                proxy=proxy,
             )
 
         if self.enabled["keepalive"]:
             runners["keepalive"] = keepalive.KeepaliveRunner(
-                self.cred, log=self._log
+                self.cred, log=self._log, env=env, proxy=proxy
             )
 
         if self.enabled["school"]:
@@ -209,6 +228,8 @@ class TaskScheduler(threading.Thread):
                 timeout=self.cfg.timeout,
                 transport=self.transport,
                 log=self._log,
+                env=env,
+                proxy=proxy,
             )
 
         if self.enabled["cat"]:
@@ -217,6 +238,8 @@ class TaskScheduler(threading.Thread):
                 timeout=self.cfg.timeout,
                 transport=self.transport,
                 log=self._log,
+                env=env,
+                proxy=proxy,
             )
         return runners
 
@@ -263,7 +286,6 @@ class TaskScheduler(threading.Thread):
             reason_text = "未找到登录凭据" if self.cred is None else "执行体未构建"
             return TaskOutcome(key, False, f"{TASK_LABELS[key]}不可用：{reason_text}")
         return self._run_kind(key, reason, runner)
-
     def run_all_tasks(self, reason: str = "manual") -> list[TaskOutcome]:
         """立即执行全部已启用任务（互不阻塞，并行派发）。"""
         keys = [k for k in TASK_KEYS if k in self.runners]
@@ -285,6 +307,12 @@ class TaskScheduler(threading.Thread):
             self._append_history(oc.as_dict())
         if not oc.ok:
             self._log(f"[tasks] {TASK_LABELS[key]} 未成功：{oc.summary}")
+        if self._on_result is not None:
+            # 回调失败绝不能带崩排程线程：它只是观测用途。
+            try:
+                self._on_result(key, oc.as_dict())
+            except Exception as e:  # noqa: BLE001
+                self._log(f"[tasks] WARN 结果回调异常：{e}")
         return oc
 
     def _fire(self, keys: list[str], reason: str) -> list[TaskOutcome]:

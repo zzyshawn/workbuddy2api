@@ -39,7 +39,10 @@ from typing import Callable
 
 import httpx
 
-BILLING_BASE = "https://www.codebuddy.cn"
+import environments
+
+#: billing 域 base：国内版 www.codebuddy.cn，国际版 www.codebuddy.ai（由 environments 解析）。
+BILLING_BASE = environments.base_for("billing")
 CHECKIN_PATH = "/v2/billing/meter/daily-checkin"
 RESOURCE_PATH = "/v2/billing/meter/get-user-resource"
 
@@ -158,6 +161,20 @@ class BalanceResult:
 _ALREADY_MARKERS = ("已签到", "already", "checkin", "check-in", "重复签到")
 
 
+def brief_text(text, limit: int = 160) -> str:
+    """把上游返回的原文压成**单行短摘要**。
+
+    为什么需要：billing 域出错时返回的是一整页 openresty 的 HTML 401
+    （带换行、缩进、几百字符）。原样塞进 msg 会导致——
+      - 日志里一条记录被撑成十几行，把有效信息淹掉；
+      - 状态快照的 points.msg 变成一大坨 HTML，文件彻底没法看。
+    这里统一压空白 + 截断：保留「401 / Authorization Required」这类判因关键信息，
+    丢掉排版噪声。原始响应体在 DEBUG 级别的报文里另有记录，不靠这里承载。
+    """
+    s = " ".join(str(text or "").split())
+    return s[:limit] + ("…" if len(s) > limit else "")
+
+
 def _is_already(status: int, code: int | None, msg: str) -> bool:
     if code == 10001:
         return True
@@ -173,14 +190,18 @@ def do_checkin(
     base_url: str = BILLING_BASE,
     timeout: float = DEFAULT_TIMEOUT,
     transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
 ) -> CheckinResult:
     """执行每日签到。重复签到（code 10001 / 「已签到」文案）归为 already，不算失败。
 
-    transport 仅用于测试注入（httpx 的 transport）。
+    transport 仅用于测试注入（httpx 的 transport）；env / proxy 走 environments 默认链。
     """
     url = base_url.rstrip("/") + CHECKIN_PATH
     try:
-        with httpx.Client(timeout=timeout, transport=transport) as c:
+        with environments.make_client(
+            env, proxy=proxy, timeout=timeout, transport=transport
+        ) as c:
             r = c.post(url, headers=headers, json={})
     except Exception as e:  # noqa: BLE001 — 网络异常不该让调度线程崩
         return CheckinResult(ok=False, already=False, status=-1, code=None, msg=f"网络失败：{e}")
@@ -195,7 +216,7 @@ def do_checkin(
         if env.get("data") is not None:
             data_str = json.dumps(env["data"], ensure_ascii=False)[:400]
     except Exception:  # noqa: BLE001
-        msg = r.text[:200]
+        msg = brief_text(r.text)
 
     if r.status_code < 400 and (code in (0, None)):
         return CheckinResult(True, False, r.status_code, code, msg or "OK", data=data_str)
@@ -209,13 +230,15 @@ def fetch_balance(
     base_url: str = BILLING_BASE,
     timeout: float = DEFAULT_TIMEOUT,
     transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
 ) -> BalanceResult:
     """查询可花费积分余额（所有套餐 CycleCapacityRemain / CapacityRemain 聚合）。
 
     聚合口径与参考实现一致：CycleCapacitySize > 0 时取 CycleCapacityRemain，否则取
     CapacityRemain；负值钳 0；跨套餐求和。
 
-    transport 仅用于测试注入（httpx 的 transport）。
+    transport 仅用于测试注入（httpx 的 transport）；env / proxy 走 environments 默认链。
     """
     url = base_url.rstrip("/") + RESOURCE_PATH
     now = time.time()
@@ -230,7 +253,9 @@ def fetch_balance(
         ),
     }
     try:
-        with httpx.Client(timeout=timeout, transport=transport) as c:
+        with environments.make_client(
+            env, proxy=proxy, timeout=timeout, transport=transport
+        ) as c:
             r = c.post(url, headers=headers, json=body)
     except Exception as e:  # noqa: BLE001
         return BalanceResult(ok=False, status=-1, msg=f"网络失败：{e}")
@@ -238,7 +263,7 @@ def fetch_balance(
     try:
         env = r.json()
     except Exception:  # noqa: BLE001
-        return BalanceResult(ok=False, status=r.status_code, msg=r.text[:200])
+        return BalanceResult(ok=False, status=r.status_code, msg=brief_text(r.text))
 
     if r.status_code >= 400 or env.get("code") not in (0, None):
         return BalanceResult(
@@ -303,6 +328,8 @@ class CheckinScheduler(threading.Thread):
         run_on_start: bool = False,
         catchup_window: float = DEFAULT_CATCHUP_WINDOW,
         log: Callable[[str], None] | None = None,
+        env: str | None = None,
+        proxy: str | None = None,
     ):
         super().__init__(name="checkin-scheduler", daemon=True)
         self.cred = cred
@@ -313,13 +340,63 @@ class CheckinScheduler(threading.Thread):
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.run_on_start = bool(run_on_start)
         self.catchup_window = float(catchup_window)
+        self.env = env
+        self.proxy = proxy
         self._log = log or (lambda _m: None)
 
         self._stop = threading.Event()
         self._run_lock = threading.Lock()
         self._fired: set[tuple[str, int]] = set()
         self.last: dict | None = None
+        #: 最近一次「只查余额」的结果（见 refresh_points）。与 last 分开存：
+        #: last 的语义是「最近一次签到记录」，把纯查询结果混进去会让 /health 的
+        #: 签到栏位出现「看起来签过、但 code 是查余额产生的」这种误导。
+        self.points: dict | None = None
         self.history: list[dict] = self._load_history()
+
+    # ------------------------------------------------------------ 余额查询
+
+    def refresh_points(self) -> dict | None:
+        """只查余额、**不签到**，结果存进 self.points。
+
+        为什么单独开一个方法：`run_once()` 会真的发起签到，拿它来刷新余额等于
+        把观测动作变成写操作（还会命中「重复签到」的幂等分支，纯属噪音）。
+        状态快照需要在任务跑完后刷新积分，用的就是这个方法。
+
+        异常一律收敛成 points 里的 ok=False，不向外抛 —— 观测失败不该影响调用方。
+        """
+        if self.cred is None:
+            self.points = {
+                "at": int(time.time()),
+                "ok": False,
+                "msg": "未找到登录凭据",
+                "remain": None,
+                "accounts": [],
+            }
+            return self.points
+        try:
+            headers = self.cred.get_headers(within_ms=REFRESH_WINDOW_MS)
+            bill = to_billing_headers(headers)
+            bal = fetch_balance(
+                bill, base_url=self.base_url, timeout=self.timeout,
+                env=self.env, proxy=self.proxy,
+            )
+            self.points = {
+                "at": int(time.time()),
+                "ok": bal.ok,
+                "msg": None if bal.ok else bal.msg,
+                "remain": bal.remain if bal.ok else None,
+                "accounts": bal.accounts if bal.ok else [],
+            }
+        except Exception as e:  # noqa: BLE001
+            self.points = {
+                "at": int(time.time()),
+                "ok": False,
+                "msg": f"查询失败：{e}",
+                "remain": None,
+                "accounts": [],
+            }
+        return self.points
 
     # ------------------------------------------------------------ 持久化
 
@@ -378,8 +455,14 @@ class CheckinScheduler(threading.Thread):
 
             try:
                 bill = to_billing_headers(headers)
-                res = do_checkin(bill, base_url=self.base_url, timeout=self.timeout)
-                bal = fetch_balance(bill, base_url=self.base_url, timeout=self.timeout)
+                res = do_checkin(
+                    bill, base_url=self.base_url, timeout=self.timeout,
+                    env=self.env, proxy=self.proxy,
+                )
+                bal = fetch_balance(
+                    bill, base_url=self.base_url, timeout=self.timeout,
+                    env=self.env, proxy=self.proxy,
+                )
 
                 self._log(f"[checkin] {reason} → {res.summary()}；{bal.summary()}")
                 if bal.ok:
@@ -401,6 +484,14 @@ class CheckinScheduler(threading.Thread):
                     "balance_msg": None if bal.ok else bal.msg,
                     "accounts": bal.accounts,
                     "elapsed_ms": int((time.time() - started) * 1000),
+                }
+                # 顺带同步一份到 points，避免「刚签完到，快照却还在用上次的余额」
+                self.points = {
+                    "at": int(time.time()),
+                    "ok": bal.ok,
+                    "msg": None if bal.ok else bal.msg,
+                    "remain": bal.remain if bal.ok else None,
+                    "accounts": bal.accounts if bal.ok else [],
                 }
             except Exception as e:  # noqa: BLE001
                 self._log(f"[checkin] ERR {reason} 执行异常：{e}")
@@ -504,7 +595,12 @@ class CheckinScheduler(threading.Thread):
             "next_fire_ts": int(nxt) if nxt else None,
             "run_on_start": self.run_on_start,
             "billing_base": self.base_url,
+            "env": self.env,
+            "proxy": environments.redact_proxy(self.proxy) if self.proxy else (
+                environments.redact_proxy(environments.resolve_proxy(self.env)) or ""
+            ),
             "last": self.last,
+            "points": self.points,
             "history_tail": self.history[-5:],
         }
 
@@ -522,4 +618,5 @@ __all__ = [
     "do_checkin",
     "fetch_balance",
     "billing_ua",
+    "brief_text",
 ]

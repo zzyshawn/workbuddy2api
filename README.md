@@ -290,7 +290,24 @@ uv run converter.py --desensitize --log converter.log
 
 ### 日志里能看到什么
 
-每次请求都会带一个唯一 ID，常见日志包括：
+**每个 HTTP 请求都会留下一行访问日志**（中间件统一记，不依赖各端点自觉）：
+
+```
+[192.168.1.20] POST /v1/chat/completions → 200 | 3421ms | model=gemini-3.5-flash | ua=CherryStudio/1.2
+[192.168.1.20] GET /v1/models → 200 | 2ms | ua=NewAPI/0.6
+[10.0.0.5] GET /v1/models → 401 | 1ms | ua=curl/8.5.0
+```
+
+四个字段分别回答「谁连的 / 连了什么 / 结果如何 / 花了多久」：
+
+- 开头的 IP：优先取 `X-Forwarded-For` 首个非 `unknown` 项 —— 经过 New API
+  之类的中转面板时，`remote_addr` 是面板自己，只有 XFF 才能看出真实来源。
+- `model=`：仅聊天类端点有（模型名在请求体里，端点解析后顺手登记）。
+- 这一行**覆盖了以前的三处盲区**：`/v1/models` 过去完全没日志；401 在进端点前
+  就返回、端点内记不到；也没有任何地方记录客户端 IP。
+  `/health` 会被容器 healthcheck 每 30 秒打一次，**故意跳过**不记。
+
+然后才是每个聊天请求带唯一 ID 的详细日志：
 
 - `REQUEST BODY`
 - `RESPONSES → CHAT BODY`
@@ -306,6 +323,61 @@ uv run converter.py --desensitize --log converter.log
 - tool schema 压缩量
 - 是否丢掉了 harness 消息
 - 是否保留了 anchor user
+
+### 状态快照（`state.json`）
+
+不想翻流水账时，直接看这一份文件：
+
+```
+logs/state.json
+```
+
+它把「当前可用模型 / 积分余额 / 任务状态」聚合成 JSON，路径默认**跟 `--log` 同目录**，
+所以在群晖上 File Station 点开 `logs/` 就能看到，不需要新增挂载。
+
+```bash
+# 默认：logs/converter.log 旁边生成 logs/state.json
+uv run converter.py --log /logs/converter.log
+
+# 显式指定位置与刷新间隔
+uv run converter.py --log /logs/converter.log --state-file /logs/state.json --state-interval 1800
+```
+
+内容长这样：
+
+```json
+{
+  "schema": 1,
+  "updated_at": "2026-09-20 09:00:12",
+  "env": "intl",
+  "models": { "source": "upstream", "count": 20, "ids": ["gpt-6-astra", "..."], "fetched_at": "..." },
+  "credential": { "uid": "...", "nickname": "...", "token_expired": false },
+  "points": {
+    "remain": 379,
+    "accounts": [{ "package": "Bonus Pack", "remain": 250, "size": 250 }],
+    "updated_at": "...", "source": "refresh"
+  },
+  "checkin": { "enabled": true, "hours": [9, 21], "next_fire_at": "...", "last": { "ok": true } },
+  "tasks": { "alive": true, "next_wake_at": "...", "last": { "checkin": "今日已签到" } }
+}
+```
+
+刷新时机（事件驱动为主，周期兜底）：
+
+| 时机 | 说明 |
+|---|---|
+| 启动时 | 写一次，保证文件立刻存在 |
+| 模型清单刷新后 | 每次成功解析模型都更新 |
+| 每类定时任务跑完后 | 积分正是在这些时点变化的 |
+| 周期兜底 | 默认 1 小时（`--state-interval` 调整，`0` = 只在事件时刷新） |
+
+几个要点：
+
+- **`points` 是纯查询来的**，走 `refresh_points()` 而不是签到 —— 刷新观测数据不该
+  触发写操作。`source` 字段标明是 `refresh`（即时查询）还是 `checkin`（签到附带）。
+- **原子写**：先写 `state.json.tmp` 再 `os.replace`，所以读到的一定是完整 JSON。
+- **写失败只记日志**，不影响服务；`/health` 的 `snapshot` 字段能看到写入次数与上次错误。
+- 快照路径也会在 `/health` 里回显（`snapshot.file`），启动横幅里也会打印一行。
 
 ### 最常见问题
 
@@ -352,9 +424,165 @@ uv run converter.py --desensitize --log converter.log
 
 前提是把宿主机登录态目录挂进去，因为容器里拿不到桌面端 auth 文件。
 
+> ⚠️ **auth 目录必须可写**（不要加 `:ro`）。
+> `converter.py` 在 token 临近过期时会用 `os.replace()` 原子回写 auth 文件；
+> 只读挂载会导致刷新失败 → 后端一路 401。
+> 同理，要挂**目录**而不是单个 `.info` 文件，否则容器内 rename 会报 busy。
+
+### 群晖（Synology）
+
+群晖用 Container Manager（旧名 Docker 套件）的「项目」功能即可。推荐目录布局：
+
+```text
+/volume1/docker/workbuddy2api/          <- 代码（compose.yaml 所在处）
+/volume1/docker/workbuddy2api/auth/     <- 凭据
+/volume1/docker/workbuddy2api/logs/     <- 日志
+```
+
+> ⚠️ **这两个挂载目录必须先手工建好**。群晖的 Docker **不会**自动创建 bind mount 的
+> 宿主机目录（Linux 上会，群晖不会），缺目录时项目启动直接报
+> `Bind mount failed`。所以先去 File Station 在 `/volume1/docker/workbuddy2api/`
+> 下建出 `auth/` 和 `logs/`，再创建项目。
+
+凭据**按环境分开放**（两个环境是两份不同账号的 token，混放会随机取错 → 401）：
+
+```text
+auth/cn/workbuddy-desktop.info                 <- 国内版
+auth/intl/Tencent-Cloud.coding-copilot.info    <- 国际版
+```
+
+只用一个环境时，把 `.info` 直接丢 `auth/` 根目录也行 —— 容器会按凭据里的
+`auth.domain` 自动认领（`CODEBUDDY2OPENAI_ENV=auto`）。
+
+凭据从电脑获取的位置：
+
+| 系统 | 路径 |
+|---|---|
+| Windows | `%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\` |
+| macOS | `~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/` |
+| Linux | `~/.local/share/CodeBuddyExtension/Data/Public/auth/` |
+
+群晖上 `compose.yaml` 里请用**绝对路径**（`./` 相对路径在 Container Manager 里容易解析错），
+仓库里给的默认值已经是 `/volume1/docker/workbuddy2api/...`，按自己的共享文件夹改。
+
+**路线 A —— Container Manager 图形界面**
+
+1. 把整个仓库传到 `/volume1/docker/workbuddy2api/`（File Station 上传或 `rsync`）。
+2. File Station 里建好 `auth/`、`logs/`、`auth/cn/`、`auth/intl/`，把 `.info` 放进去。
+3. Container Manager →「项目」→ 创建 → 路径选 `/volume1/docker/workbuddy2api`，
+   来源选「使用现有的 docker-compose.yml」。
+4. 编辑 YAML，改掉挂载路径与 `CODEBUDDY2OPENAI_KEY`，再创建。
+5. 若启动时报镜像不存在，到「项目」→ 动作 →「构建」（等价 `up --build --no-start`）先建镜像。
+
+**路线 B —— SSH 命令行**（推荐，出问题时日志更好读）
+
+```bash
+cd /volume1/docker/workbuddy2api
+sudo docker compose up -d --build
+```
+
+验证：
+
+```bash
+curl http://127.0.0.1:8787/health
+curl http://127.0.0.1:8787/v1/models -H "Authorization: Bearer <你的KEY>"
+```
+
+> `/health` **不参与鉴权**（公开端点，供 healthcheck 用），且会回显 uid、昵称、
+> 企业名和凭据文件路径。只想本机访问就把端口改成 `127.0.0.1:8787:8787`，
+> 要暴露到局域网则务必设置 `CODEBUDDY2OPENAI_KEY`。
+
+#### 只往 NAS 传一个包（带版本号，tar 包 → 解成目录再构建）
+
+不想在 NAS 上同步整个仓库时，可以本机打好包，只传一个
+`wb2api-<版本>.tar.gz`。
+
+> **包名带版本，且版本与 CodeBuddy CLI 对齐。** 版本号只有一个真源 ——
+> `model_registry.CLI_UA_VERSION`（也就是本服务对上游声明
+> `User-Agent: CLI/<ver> CodeBuddy/<ver>` 时用的那个版本）。包名、
+> 包内 `VERSION`、`compose.yaml` 的 image tag 全部由它派生，不会各说各话。
+> 要换版本只改 `model_registry.CLI_UA_VERSION` 一处，其余由测试守着。
+
+> 🚫 **群晖 Container Manager 不支持 `.tar.gz` 作为 build context。**
+> 写 `context: ./wb2api-2.155.0.tar.gz` 会直接报：
+>
+> ```text
+> unable to prepare context: context must be a directory:
+> ```
+>
+> （实测。群晖的构建器只认目录。普通 Linux 上 `docker build` 是支持 tar context 的，
+> 所以这条限制**只在群晖上暴露**，本地测不出来。）
+>
+> 因此 `test_deployment.py::test_compose_context_is_a_directory` 会守着这条。
+
+**本机打包 + 同时解出源码目录**（脚本已处理中文路径、反斜杠、凭据排除等坑）：
+
+```bash
+cd <仓库的 workbuddy2api 目录>
+python3 pack_for_nas.py --extract ../wb2api-src
+```
+
+输出会带版本号与 SHA256，方便传输后核对：
+
+```text
+✅ 打包完成：D:\mycode\myworkbuddy2api\wb2api-2.155.0.tar.gz
+   版本  ：2.155.0（与 CodeBuddy CLI 对齐）
+   文件数：44
+   大小  ：172.9 KB
+   SHA256：ae66f5fa...
+
+✅ 已解压到目录：D:\mycode\myworkbuddy2api\wb2api-src
+   文件数：44
+```
+
+> SHA256 是**可复现**的：打包时已归一元信息（mtime/uid/gid），
+> 同样内容连打两次哈希完全一致，可以当真用来对账。
+> 包名也可以固定成别的版本：`pack_for_nas.py -o wb2api-9.9.9.tar.gz`。
+
+**把解出来的目录拷到 NAS**：
+
+```bash
+scp -r wb2api-src <NAS用户>@<NAS_IP>:/volume1/docker/workbuddy2api/src
+```
+
+**compose 指向该目录，并把 image tag 改成包版本**：
+
+```yaml
+build:
+  context: ./src          # ← 目录，不是 tar 包
+  dockerfile: Dockerfile
+image: workbuddy2api:2.155.0    # ← 换包时同步改，见下方说明
+```
+
+然后照常 `sudo docker compose up -d --build`。
+
+> 不想在本地解压也行 —— 把 tar 包传上去后在 NAS 上解：
+> `mkdir -p src && tar -xzf wb2api-2.155.0.tar.gz -C src`，再 `context: ./src`。
+
+**包的硬约束**（`context: ./x.tar.gz` 场景下才需要，但解压同样受益）：
+
+1. **包根就是项目根** —— 不能有 `workbuddy2api/` 这层前缀，
+   否则 `COPY requirements.txt .` 找不到文件；
+2. 必须含 `Dockerfile`。
+
+`pack_for_nas.py` 已按此约定生成（扁平结构 + 正斜杠路径 + 附 `VERSION`）。
+`test_pack_script_produces_flat_archive` 与 `test_pack_script_can_extract_to_directory`
+分别守着「打包」和「解压」这两步。
+
+> 无论用哪种方式，`auth/` 和 `logs/` 仍要在 `/volume1/docker/workbuddy2api/` 下
+> 手工建好 —— 包只管代码，不管数据。
+>
+> **image tag 带版本**（如 `workbuddy2api:2.155.0`）是刻意的：
+> 固定 tag 会让 `docker compose up -d` 直接复用旧镜像、**掩盖重建**，
+> 表现为「改了 environment 没生效」。带版本号后换包就得改 tag，
+> 改了必然重建，`docker images` 里也能一眼看出跑的是哪版。
+> 改完仍建议走完整套：`down` → `build --no-cache` → `up -d`。
+>
+> NAS 上核对版本：`cat src/VERSION`，或 `docker inspect` 看 image tag。
+
 ### docker compose
 
-先改 `docker-compose.yml` 里的 auth 挂载路径，再执行：
+先改 `compose.yaml` 里的 auth 挂载路径，再执行：
 
 ```bash
 docker compose up -d --build
@@ -365,9 +593,15 @@ docker compose up -d --build
 ```bash
 docker build -t workbuddy2api .
 
+# 注意：/data/auth 不要加 :ro —— token 刷新需要回写
 docker run -d --name workbuddy2api -p 8787:8787 \
-  -v ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth:/data/auth:ro \
+  -v /volume1/docker/workbuddy2api/auth:/data/auth \
+  -v /volume1/docker/workbuddy2api/logs:/logs \
   -e CODEBUDDY_AUTH_DIR=/data/auth \
+  -e CODEBUDDY2OPENAI_ENV=auto \
+  -e TZ=Asia/Shanghai \
+  -e CODEBUDDY2OPENAI_KEY=换成你自己的随机串 \
+  --restart unless-stopped \
   workbuddy2api
 ```
 
@@ -376,8 +610,16 @@ docker run -d --name workbuddy2api -p 8787:8787 \
 | 变量 | 说明 |
 |------|------|
 | `CODEBUDDY_AUTH_DIR` | 指定登录态目录 |
+| `CODEBUDDY2OPENAI_ENV` | 环境选择：`cn`（国内版）/ `intl`（国际版）/ `auto`（按凭据的 `auth.domain` 自动判定，推荐） |
+| `CODEBUDDY2OPENAI_PROXY_CN` | 仅国内版走的代理，如 `http://192.168.1.100:7890` 或 `socks5://...` |
+| `CODEBUDDY2OPENAI_PROXY_INTL` | 仅国际版走的代理 |
+| `CODEBUDDY2OPENAI_PROXY` | 两个环境都用同一个代理时的兜底（优先级低于上面两个） |
+| `CODEBUDDY2OPENAI_AUTH_CN` | 显式指定国内版凭据文件/目录（优先级高于 `CODEBUDDY_AUTH_DIR`） |
+| `CODEBUDDY2OPENAI_AUTH_INTL` | 显式指定国际版凭据文件/目录 |
 | `CODEBUDDY2OPENAI_KEY` | 本地 API Key |
 | `CODEBUDDY2OPENAI_LOG` | 日志路径 |
+| `CODEBUDDY2OPENAI_STATE_FILE` | 状态快照路径（默认与 `CODEBUDDY2OPENAI_LOG` 同目录的 `state.json`） |
+| `CODEBUDDY2OPENAI_STATE_INTERVAL` | 状态快照的周期刷新秒数，默认 3600；`0` = 只在事件时刷新 |
 | `CODEBUDDY2OPENAI_CACHE_DIR` | 模型快照 / 签到留档 / 任务留档的落盘目录 |
 | `CODEBUDDY2OPENAI_MODELS_TTL` | 模型列表缓存时长（秒） |
 | `CODEBUDDY2OPENAI_CHECKIN_HOURS` | 每日签到的整点时刻，如 `9,21` |
@@ -388,6 +630,20 @@ docker run -d --name workbuddy2api -p 8787:8787 \
 | `CODEBUDDY2OPENAI_CAT_HOURS` | 夜猫子任务的整点时刻，如 `1` |
 | `CODEBUDDY2OPENAI_ACTIVITY_REPORT_COUNT` | 每次活跃上报的条数，默认 `5` |
 | `CODEBUDDY2OPENAI_BILLING_UA` | billing 域 User-Agent（留空用内置 CLI UA） |
+
+### 分环境代理怎么选
+
+| 场景 | 配置 |
+|---|---|
+| 国内版直连、国际版要代理（最常见） | 只填 `CODEBUDDY2OPENAI_PROXY_INTL` |
+| 两个环境都走同一个代理 | 只填 `CODEBUDDY2OPENAI_PROXY` |
+| 都直连（如海外 VPS 跑国际版） | 都不填 |
+
+代理是**按环境**选的，不是按目标域选的 —— 同一个环境的所有请求都走它自己的代理。
+实测走代理比直连慢 3~10 倍，所以别为了省事给直连得了的环境也配代理。
+
+`socks5://` 需要镜像里的 `httpx[socks]`，`requirements.txt` 已含。
+
 
 ---
 

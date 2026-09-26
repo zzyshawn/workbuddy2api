@@ -8,8 +8,9 @@
   - internal/auth + client.go      账号视图与信封解析
 
 域与路径（实测）：
+    域映射由 environments 决定（国内版 / 国际版只差域名，路径完全同源）：
 
-    growth 域   https://copilot.tencent.com
+    growth 域   cn: copilot.tencent.com      intl: www.codebuddy.ai
       GET  /activity/growth/buddy/info           当前猫档案（data.buddy 为 null = 无猫）
       GET  /activity/growth/buddy/travel/status  旅行状态
       POST /activity/growth/buddy/travel/depart  {"location_id": 4}
@@ -20,9 +21,9 @@
       GET  /v2/activity/growth/tasks             成长任务列表
       POST /v2/activity/growth/tasks/accept      {"task_codes": [...]}
       POST /activity/growth/tasks/{code}/claim   领奖（无 body）
-    billing 域  https://www.codebuddy.cn
+    billing 域  cn: www.codebuddy.cn         intl: www.codebuddy.ai
       POST /v2/report                            对话活跃上报（必带 userId）
-    web 域      https://www.workbuddy.cn
+    web 域      cn: www.workbuddy.cn         intl: www.codebuddy.ai（降级兜底）
       POST /activity/growth/tasks/{code}/claim   chat 域 400 时的领奖降级路径
 
 为什么单独一层：活跃上报 / 猫猫旅行 / 开学季 / 夜猫子都要打这两个域，但它们彼此独立
@@ -49,15 +50,21 @@ from typing import Any, Callable
 
 import httpx
 
-from checkin import to_billing_headers
+import environments
+from checkin import brief_text, to_billing_headers
 
 # ---------------------------------------------------------------------------
 # 域与常量
+#
+# 三个域改由 environments 解析 —— 国内版 / 国际版的差别全在这里：
+# 国内版 chat 与 billing 分属两个域，国际版收敛到 www.codebuddy.ai 同一个域。
+# 取值时机是**模块导入时**（读 CODEBUDDY2OPENAI_ENV，兜底 cn），与改造前行为一致；
+# 要按单次调用切换环境，用函数上的 env= 参数。
 # ---------------------------------------------------------------------------
 
-GROWTH_BASE = "https://copilot.tencent.com"
-BILLING_BASE = "https://www.codebuddy.cn"
-WEB_BASE = "https://www.workbuddy.cn"
+GROWTH_BASE = environments.base_for("chat")
+BILLING_BASE = environments.base_for("billing")
+WEB_BASE = environments.base_for("web")
 
 DEFAULT_TIMEOUT = 60.0
 
@@ -208,9 +215,12 @@ def _parse_envelope(status: int, text: str) -> tuple[int | None, str, Any]:
     try:
         env = json.loads(text)
     except Exception:  # noqa: BLE001
-        return None, (text or "")[:200], None
+        # 非 JSON 信封（典型：openresty 的 HTML 401）→ 压成单行短摘要。
+        # 不压的话这条 msg 会带着换行和缩进灌进日志与状态快照，
+        # 把一条记录撑成十几行（实测过）。
+        return None, brief_text(text), None
     if not isinstance(env, dict):
-        return None, str(env)[:200], None
+        return None, brief_text(env), None
     code = env.get("code")
     msg = str(env.get("msg") or env.get("message") or "")
     return (code if isinstance(code, int) else None), msg, env.get("data")
@@ -225,18 +235,25 @@ def api_call(
     body: Any = None,
     timeout: float = DEFAULT_TIMEOUT,
     transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
 ) -> ApiResult:
     """打一次上游接口并解信封。
 
     body=None 表示**不带请求体**（如领奖端点是空 POST）；这一点必须区分，
     否则 httpx 会把 None 序列化成 `null` 发出去。
+
+    env / proxy 缺省时走 environments 的默认链（CODEBUDDY2OPENAI_ENV →
+    凭据域/兜底 cn；代理取当前环境对应的 CODEBUDDY2OPENAI_PROXY_CN / _INTL）。
     """
     url = base.rstrip("/") + path
     kwargs: dict = {"headers": headers}
     if body is not None:
         kwargs["json"] = body
     try:
-        with httpx.Client(timeout=timeout, transport=transport) as c:
+        with environments.make_client(
+            env, proxy=proxy, timeout=timeout, transport=transport
+        ) as c:
             r = c.request(method, url, **kwargs)
     except Exception as e:  # noqa: BLE001 — 网络异常不该让调度线程崩
         return ApiResult(False, -1, None, f"网络失败：{e}")
@@ -255,6 +272,8 @@ def growth_call(
     timeout: float = DEFAULT_TIMEOUT,
     transport: object | None = None,
     base_url: str = GROWTH_BASE,
+    env: str | None = None,
+    proxy: str | None = None,
 ) -> ApiResult:
     return api_call(
         base_url,
@@ -264,6 +283,8 @@ def growth_call(
         body=body,
         timeout=timeout,
         transport=transport,
+        env=env,
+        proxy=proxy,
     )
 
 
@@ -276,6 +297,8 @@ def billing_call(
     timeout: float = DEFAULT_TIMEOUT,
     transport: object | None = None,
     base_url: str = BILLING_BASE,
+    env: str | None = None,
+    proxy: str | None = None,
 ) -> ApiResult:
     return api_call(
         base_url,
@@ -285,6 +308,8 @@ def billing_call(
         body=body,
         timeout=timeout,
         transport=transport,
+        env=env,
+        proxy=proxy,
     )
 
 
@@ -294,10 +319,17 @@ def billing_call(
 
 
 def fetch_buddy(
-    acct: Account, *, timeout: float = DEFAULT_TIMEOUT, transport: object | None = None
+    acct: Account,
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
 ) -> ApiResult:
     """查当前猫档案。ok=True 且 data is None 表示**无猫**（data.buddy 为 null）。"""
-    res = growth_call(acct, PATH_BUDDY_INFO, timeout=timeout, transport=transport)
+    res = growth_call(
+        acct, PATH_BUDDY_INFO, timeout=timeout, transport=transport, env=env, proxy=proxy
+    )
     if not res.ok:
         return res
     buddy = (res.data or {}).get("buddy") if isinstance(res.data, dict) else None
@@ -306,10 +338,17 @@ def fetch_buddy(
 
 
 def fetch_travel_status(
-    acct: Account, *, timeout: float = DEFAULT_TIMEOUT, transport: object | None = None
+    acct: Account,
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
 ) -> ApiResult:
     """查旅行状态：data = {state, daily_limit_reached, record_id, reward_credit}。"""
-    res = growth_call(acct, PATH_TRAVEL_STATUS, timeout=timeout, transport=transport)
+    res = growth_call(
+        acct, PATH_TRAVEL_STATUS, timeout=timeout, transport=transport, env=env, proxy=proxy
+    )
     if not res.ok:
         return res
     d = res.data if isinstance(res.data, dict) else {}
@@ -328,6 +367,8 @@ def travel_depart(
     *,
     timeout: float = DEFAULT_TIMEOUT,
     transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
 ) -> ApiResult:
     """派出猫旅行。"""
     return growth_call(
@@ -337,6 +378,8 @@ def travel_depart(
         body={"location_id": int(location_id)},
         timeout=timeout,
         transport=transport,
+        env=env,
+        proxy=proxy,
     )
 
 
@@ -346,6 +389,8 @@ def travel_claim(
     *,
     timeout: float = DEFAULT_TIMEOUT,
     transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
 ) -> ApiResult:
     """领取到站奖励。data 归一为 reward_credit（奖励字段缺失记 0，不算失败）。"""
     res = growth_call(
@@ -355,6 +400,8 @@ def travel_claim(
         body={"record_id": int(record_id)},
         timeout=timeout,
         transport=transport,
+        env=env,
+        proxy=proxy,
     )
     if res.ok:
         res.data = int((res.data or {}).get("reward_credit") or 0) if isinstance(res.data, dict) else 0
@@ -362,7 +409,12 @@ def travel_claim(
 
 
 def buddy_agreement(
-    acct: Account, *, timeout: float = DEFAULT_TIMEOUT, transport: object | None = None
+    acct: Account,
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
 ) -> ApiResult:
     """同意领养协议（幂等，重复调用无副作用）。"""
     return growth_call(
@@ -372,23 +424,44 @@ def buddy_agreement(
         body={"agree": True},
         timeout=timeout,
         transport=transport,
+        env=env,
+        proxy=proxy,
     )
 
 
 def buddy_first(
-    acct: Account, *, timeout: float = DEFAULT_TIMEOUT, transport: object | None = None
+    acct: Account,
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
 ) -> ApiResult:
     """领养第一只猫（无猫且对话量达标时送 300 分）。"""
     return growth_call(
-        acct, PATH_BUDDY_FIRST, method="POST", body={}, timeout=timeout, transport=transport
+        acct,
+        PATH_BUDDY_FIRST,
+        method="POST",
+        body={},
+        timeout=timeout,
+        transport=transport,
+        env=env,
+        proxy=proxy,
     )
 
 
 def fetch_streak(
-    acct: Account, *, timeout: float = DEFAULT_TIMEOUT, transport: object | None = None
+    acct: Account,
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
 ) -> ApiResult:
     """查连登天数（只读 oracle）。data = int；缺字段记 0（= 疑似上报被静默丢弃）。"""
-    res = growth_call(acct, PATH_STREAK, timeout=timeout, transport=transport)
+    res = growth_call(
+        acct, PATH_STREAK, timeout=timeout, transport=transport, env=env, proxy=proxy
+    )
     if not res.ok:
         return res
     streak = (res.data or {}).get("streak") if isinstance(res.data, dict) else None
@@ -397,10 +470,17 @@ def fetch_streak(
 
 
 def fetch_energy(
-    acct: Account, *, timeout: float = DEFAULT_TIMEOUT, transport: object | None = None
+    acct: Account,
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
 ) -> ApiResult:
     """查能量余额（只读 oracle，仅用于日志对账）。data = balance。"""
-    res = growth_call(acct, PATH_ENERGY, timeout=timeout, transport=transport)
+    res = growth_call(
+        acct, PATH_ENERGY, timeout=timeout, transport=transport, env=env, proxy=proxy
+    )
     if res.ok:
         d = res.data if isinstance(res.data, dict) else {}
         res.data = d.get("balance")
@@ -420,10 +500,17 @@ def is_buddy_task_incomplete(res: ApiResult) -> bool:
 
 
 def list_tasks(
-    acct: Account, *, timeout: float = DEFAULT_TIMEOUT, transport: object | None = None
+    acct: Account,
+    *,
+    timeout: float = DEFAULT_TIMEOUT,
+    transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
 ) -> ApiResult:
     """拉成长任务列表。data = [task dict]（原始字段，不强转）。"""
-    res = growth_call(acct, PATH_TASKS, timeout=timeout, transport=transport)
+    res = growth_call(
+        acct, PATH_TASKS, timeout=timeout, transport=transport, env=env, proxy=proxy
+    )
     if not res.ok:
         return res
     tasks = (res.data or {}).get("tasks") if isinstance(res.data, dict) else None
@@ -445,6 +532,8 @@ def accept_tasks(
     *,
     timeout: float = DEFAULT_TIMEOUT,
     transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
 ) -> ApiResult:
     """接任务（not_accepted → accepted）。"""
     return growth_call(
@@ -454,6 +543,8 @@ def accept_tasks(
         body={"task_codes": list(codes)},
         timeout=timeout,
         transport=transport,
+        env=env,
+        proxy=proxy,
     )
 
 
@@ -463,6 +554,8 @@ def claim_task(
     *,
     timeout: float = DEFAULT_TIMEOUT,
     transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
 ) -> ApiResult:
     """领奖：chat 域优先，HTTP 400 时降级 web 域（带完整 web 头）。
 
@@ -470,7 +563,13 @@ def claim_task(
     由调用方当作「已领」而不是失败。
     """
     res = growth_call(
-        acct, CLAIM_PATH_FMT.format(code=code), method="POST", timeout=timeout, transport=transport
+        acct,
+        CLAIM_PATH_FMT.format(code=code),
+        method="POST",
+        timeout=timeout,
+        transport=transport,
+        env=env,
+        proxy=proxy,
     )
     if res.ok or res.status != 400:
         return res
@@ -481,6 +580,8 @@ def claim_task(
         method="POST",
         timeout=timeout,
         transport=transport,
+        env=env,
+        proxy=proxy,
     )
 
 
@@ -558,6 +659,8 @@ def report_events(
     headers: dict | None = None,
     timeout: float = DEFAULT_TIMEOUT,
     transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
 ) -> ApiResult:
     """上报一批事件（body 为事件数组）。默认走 billing 域。"""
     return api_call(
@@ -568,6 +671,8 @@ def report_events(
         body=list(events),
         timeout=timeout,
         transport=transport,
+        env=env,
+        proxy=proxy,
     )
 
 
@@ -581,6 +686,8 @@ def report_chat_activity(
     mode: str = "craft",
     timeout: float = DEFAULT_TIMEOUT,
     transport: object | None = None,
+    env: str | None = None,
+    proxy: str | None = None,
 ) -> ApiResult:
     """发一条对话活跃上报（点亮连登 + 解锁领养前置 first_buddy）。"""
     ev = chat_request_event(
@@ -591,7 +698,9 @@ def report_chat_activity(
         model_name=model_name,
         mode=mode,
     )
-    return report_events(acct, [ev], timeout=timeout, transport=transport)
+    return report_events(
+        acct, [ev], timeout=timeout, transport=transport, env=env, proxy=proxy
+    )
 
 
 __all__ = [

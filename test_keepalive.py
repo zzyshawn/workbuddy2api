@@ -24,9 +24,14 @@ class _Cred:
         self.expires_at = expires_at
         self.windows: list[int] = []
         self.refreshes = 0
+        #: 记录被透传进来的环境与代理（保活要把它们一路带到 CredentialManager）。
+        self.seen_env: list = []
+        self.seen_proxy: list = []
 
-    def get_headers(self, within_ms=60_000):
+    def get_headers(self, within_ms=60_000, *, env=None, proxy=None):
         self.windows.append(within_ms)
+        self.seen_env.append(env)
+        self.seen_proxy.append(proxy)
         if self.fail_msg:
             raise RuntimeError(self.fail_msg)
         self.refreshes += 1
@@ -115,6 +120,26 @@ def test_default_hours_are_22():
     print("✅ test_default_hours_are_22")
 
 
+def test_env_and_proxy_forwarded_to_credential_manager():
+    """保活刷新也要走代理 —— env/proxy 必须一路透传到 CredentialManager。
+
+    国际版部署在 NAS 上时，token 刷新打的是 chat 后端（codebuddy.ai），
+    这一路漏了代理就会刷新失败。
+    """
+    cred = _Cred()
+    r = KeepaliveRunner(cred, env="intl", proxy="socks5://u:p@1.2.3.4:1080")
+    oc = r.run_once(reason="22:00")
+    assert oc.ok
+    assert cred.seen_env == ["intl"], cred.seen_env
+    assert cred.seen_proxy == ["socks5://u:p@1.2.3.4:1080"], cred.seen_proxy
+
+    # 不传时透传 None（由 CredentialManager 自己按默认链解析）
+    cred2 = _Cred()
+    KeepaliveRunner(cred2).run_once()
+    assert cred2.seen_env == [None] and cred2.seen_proxy == [None]
+    print("✅ test_env_and_proxy_forwarded_to_credential_manager")
+
+
 if __name__ == "__main__":
     import time
 
@@ -125,4 +150,5 @@ if __name__ == "__main__":
     test_session_dead_keyword_detection()
     test_missing_credential_and_expiry_fallback()
     test_default_hours_are_22()
+    test_env_and_proxy_forwarded_to_credential_manager()
     print(f"\n全部通过（{time.time() - t0:.2f}s）")

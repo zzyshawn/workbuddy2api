@@ -59,9 +59,13 @@ class KeepaliveRunner:
         *,
         threshold: int = SESSION_DEAD_THRESHOLD,
         log: Callable[[str], None] | None = None,
+        env: str | None = None,
+        proxy: str | None = None,
     ):
         self.cred = cred
         self.threshold = max(1, int(threshold))
+        self.env = env
+        self.proxy = proxy
         self._log = log or (lambda _m: None)
 
         self._lock = threading.Lock()
@@ -80,7 +84,10 @@ class KeepaliveRunner:
             detail: dict = {"reason": reason}
             try:
                 # 大窗口 ⇒ 必然进刷新分支（见 FORCE_REFRESH_WINDOW_MS 的说明）
-                headers = self.cred.get_headers(within_ms=FORCE_REFRESH_WINDOW_MS)
+                # env/proxy 一路透传到 CredentialManager，刷新请求也走代理
+                headers = self.cred.get_headers(
+                    within_ms=FORCE_REFRESH_WINDOW_MS, env=self.env, proxy=self.proxy
+                )
             except Exception as e:  # noqa: BLE001
                 return self._store(self._on_failure(str(e), detail))
 

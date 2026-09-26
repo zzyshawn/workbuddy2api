@@ -103,6 +103,26 @@ SCHEMA_KEEP_KEYS = {
 
 def project_responses_chat_body(body: dict) -> tuple[dict, dict]:
     """把 Responses 转出来的 Chat body 投影成更适合腾讯后端的最小上下文。"""
+    projected, stats = _project_responses_chat_body_inner(body)
+    # 国际版（www.codebuddy.ai）硬性要求首条消息必须是 system prompt，
+    # 否则直接 400 + code 11128「first message is not system prompt」。
+    # 国内版没有这条约束，但补上无害 —— 收敛成一处，保证两条投影分支都覆盖到。
+    stats["system_prompt_ensured"] = _ensure_leading_system(projected)
+    return projected, stats
+
+
+def _ensure_leading_system(projected: dict) -> bool:
+    """确保 messages 首条是 system。已满足返回 False，补了一条返回 True。"""
+    messages = projected.get("messages")
+    if not isinstance(messages, list):
+        return False
+    if messages and isinstance(messages[0], dict) and messages[0].get("role") == "system":
+        return False
+    projected["messages"] = [{"role": "system", "content": BASE_SYSTEM_PROMPT}] + messages
+    return True
+
+
+def _project_responses_chat_body_inner(body: dict) -> tuple[dict, dict]:
     projected = dict(body)
     messages = list(body.get("messages") or [])
     tools = list(body.get("tools") or [])

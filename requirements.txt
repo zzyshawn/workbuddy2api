@@ -1,3 +1,6 @@
 fastapi
 uvicorn[standard]
-httpx
+# httpx 必须锁 >=0.28：0.28 起代理参数只认 `proxy=`，旧版的 `proxies=` 已被移除
+# （国内版直连时无所谓，但配 --proxy-cn/--proxy-intl 时旧版会直接 TypeError）。
+# [socks] 额外装 socksio，用于 socks5:// 代理。
+httpx[socks]>=0.28,<0.29

@@ -67,11 +67,15 @@ class BlackCatRunner:
         settle: float = SETTLE_SECONDS,
         transport: object | None = None,
         log: Callable[[str], None] | None = None,
+        env: str | None = None,
+        proxy: str | None = None,
     ):
         self.cred = cred
         self.timeout = float(timeout)
         self.settle = max(0.0, float(settle))
         self.transport = transport
+        self.env = env
+        self.proxy = proxy
         self._log = log or (lambda _m: None)
 
         self._lock = threading.Lock()
@@ -110,7 +114,7 @@ class BlackCatRunner:
     def _run(self, acct: growth_api.Account, reason: str) -> TaskOutcome:
         detail: dict = {"reason": reason, "uid": acct.uid, "task_code": TASK_CODE}
 
-        tasks = growth_api.list_tasks(acct, timeout=self.timeout, transport=self.transport)
+        tasks = growth_api.list_tasks(acct, timeout=self.timeout, transport=self.transport, env=self.env, proxy=self.proxy, )
         if not tasks.ok:
             return TaskOutcome(KEY, False, f"拉任务列表失败：{tasks.summary()}", detail)
 
@@ -147,7 +151,12 @@ class BlackCatRunner:
 
         if accept_status == "not_accepted":
             acc = growth_api.accept_tasks(
-                acct, [TASK_CODE], timeout=self.timeout, transport=self.transport
+                acct,
+                [TASK_CODE],
+                timeout=self.timeout,
+                transport=self.transport,
+                env=self.env,
+                proxy=self.proxy,
             )
             detail["accept"] = {"ok": acc.ok, "status": acc.status, "code": acc.code}
             if not acc.ok:
@@ -165,7 +174,7 @@ class BlackCatRunner:
                 model_name=NIGHT_MODEL_NAME,
                 mode="night",
                 timeout=self.timeout,
-                transport=self.transport,
+                transport=self.transport, env=self.env, proxy=self.proxy, 
             )
             if not res.ok:
                 detail.update({"sent": sent, "error": res.summary()})
@@ -176,7 +185,7 @@ class BlackCatRunner:
         # 回读确认：上游归账是异步的，先等 settle 秒，只有进度真的满了才 claim，未满如实标注、不强行刷
         if sent and self.settle:
             time.sleep(self.settle)
-        after = growth_api.list_tasks(acct, timeout=self.timeout, transport=self.transport)
+        after = growth_api.list_tasks(acct, timeout=self.timeout, transport=self.transport, env=self.env, proxy=self.proxy, )
         if not after.ok:
             return TaskOutcome(KEY, False, f"回读任务失败：{after.summary()}", detail)
         task2 = growth_api.find_task(after.data, TASK_CODE) or {}
@@ -206,7 +215,7 @@ class BlackCatRunner:
         *,
         reason: str,
     ) -> TaskOutcome:
-        res = growth_api.claim_task(acct, TASK_CODE, timeout=self.timeout, transport=self.transport)
+        res = growth_api.claim_task(acct, TASK_CODE, timeout=self.timeout, transport=self.transport, env=self.env, proxy=self.proxy, )
         detail["claim"] = {"ok": res.ok, "status": res.status, "code": res.code, "data": res.data}
         if not res.ok:
             return TaskOutcome(KEY, False, f"领奖失败：{res.summary()}", detail)

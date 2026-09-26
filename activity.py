@@ -61,6 +61,8 @@ class ActivityRunner:
         timeout: float = DEFAULT_TIMEOUT,
         transport: object | None = None,
         log: Callable[[str], None] | None = None,
+        env: str | None = None,
+        proxy: str | None = None,
         adopt: Callable[[growth_api.Account], TaskOutcome] | None = None,
     ):
         self.cred = cred
@@ -68,6 +70,8 @@ class ActivityRunner:
         self.report_gap = max(0.0, float(report_gap))
         self.timeout = float(timeout)
         self.transport = transport
+        self.env = env
+        self.proxy = proxy
         self._log = log or (lambda _m: None)
         #: 上报把对话量补满后重试领养的回调（由 task_scheduler 注入 travel 的 adopt_force）。
         self._adopt = adopt
@@ -115,7 +119,7 @@ class ActivityRunner:
                 cid,
                 f"{cid}-r{i}",
                 timeout=self.timeout,
-                transport=self.transport,
+                transport=self.transport, env=self.env, proxy=self.proxy, 
             )
             if not res.ok:
                 # 本号上报失败：不再续发（streak 自检与领养都失去意义）
@@ -159,7 +163,7 @@ class ActivityRunner:
         days == 0 → 可疑（`report OK but streak.days=0 (silent drop?)`）；
         回读失败 → 也可疑，但不影响主流程（上报本身已成功，按天幂等，不重试）。
         """
-        res = growth_api.fetch_streak(acct, timeout=self.timeout, transport=self.transport)
+        res = growth_api.fetch_streak(acct, timeout=self.timeout, transport=self.transport, env=self.env, proxy=self.proxy, )
         if not res.ok:
             self._log(f"[activity] WARN streak 回读失败（上报已成功）：{res.summary()}")
             return None, False
