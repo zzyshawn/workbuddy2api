@@ -93,7 +93,7 @@ services:
     # 镜像 tag = model_registry.SERVICE_VERSION（CLI 版本 + 服务构建号）。
     # ⚠️ 服务代码每次实质变更必须 bump model_registry.SERVICE_BUILD 并同步改这行
     # —— tag 变了 docker compose up -d 才会重建；tag 不变会静默复用旧镜像（踩过两次）。
-    image: workbuddy2api:2.158.0-b8
+    image: workbuddy2api:2.158.0-b9
     container_name: workbuddy2api
 
     ports:

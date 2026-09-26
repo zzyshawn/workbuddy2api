@@ -22,6 +22,7 @@ codebuddy2openai — 把 CodeBuddy / WorkBuddy 的订阅暴露成标准 OpenAI �
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import sys
@@ -746,11 +747,13 @@ CONFIG: dict = {
     #: 完整报文开关（默认关）。打开后把发往后端的 body / 上游原始 SSE 全文落盘。
     #: 排障用，量很大；开着会把请求级日志重新淹掉。
     "log_bodies": False,
-    #: 网络错误自动重试次数（默认 1，0 = 关闭）。**只对「还没向客户端发出任何字节」
+    #: 网络错误自动重试次数（默认 5，0 = 关闭）。**只对「还没向客户端发出任何字节」
     #: 的失败生效** —— 建连失败 / SOCKS 隧道抖动 / 上游在出首字节前重置。
     #: 已开始转发后再断流不能重试（客户端已收到部分数据，重发会内容重复）；
     #: 上游明确回非 200 也不重试（确定性拒绝，立刻重试结果一样）。
-    "stream_retry": 1,
+    "stream_retry": 5,
+    #: 重试间隔基数（秒），指数退避：2/4/8/16/30（封顶 30s）。0 = 不等待立即重试。
+    "stream_retry_gap": 2.0,
 }
 # cred: CredentialManager | None；registry: ModelRegistry | None
 # checkin: CheckinScheduler | None（签到执行体，供 /admin/checkin 沿用旧结构）
@@ -800,6 +803,17 @@ def _log_body(msg: str):
 def _truncate(s: str, n: int = 80) -> str:
     s = str(s).replace("\n", " ").strip()
     return s[:n] + ("…" if len(s) > n else "")
+
+
+async def _retry_wait(attempt: int) -> None:
+    """第 attempt 次（从 1 计）网络失败后的退避等待。
+
+    指数退避：2/4/8/16/30…封顶 30s。2026-09-26 线上实测代理链路是「抖一阵就好」，
+    立即重试经常撞在同一个抖动窗口里，加间隔后才真正吃得下抖动恢复期。
+    """
+    gap = max(0.0, float(CONFIG.get("stream_retry_gap", 2)))
+    if gap > 0:
+        await asyncio.sleep(min(gap * (2 ** (attempt - 1)), 30.0))
 
 
 def _pad_label(s: str, width: int = 16) -> str:
@@ -1312,6 +1326,7 @@ async def chat_completions(
                 f"[{rid}] ↻ 网络错误 | {model_name} | {type(e).__name__}: {e}"
                 f" | 自动重试 {attempt}/{retries}"
             )
+            await _retry_wait(attempt)
     _log_finish(model_name, t0, collected, rid)
     return JSONResponse(content=collected)
 
@@ -1645,6 +1660,7 @@ async def _stream_upstream(
                 f"{prefix}↻ 网络错误（首字节前）| {model_name} | {type(e).__name__}: {e}"
                 f" | 自动重试 {attempt}/{retries}"
             )
+            await _retry_wait(attempt)
     if terminal:
         return
 
@@ -1741,6 +1757,7 @@ async def _post_backend_once(
                 f"{prefix}↻ 网络错误 | {model_name} | {type(e).__name__}: {e}"
                 f" | 自动重试 {attempt}/{retries}"
             )
+            await _retry_wait(attempt)
     raise RuntimeError("unreachable")  # pragma: no cover
 
 
@@ -2106,6 +2123,7 @@ async def _collect_anthropic_nonstream(
                 f"{prefix}↻ 网络错误 | {model_name} | {type(e).__name__}: {e}"
                 f" | 自动重试 {attempt}/{retries}"
             )
+            await _retry_wait(attempt)
 
     elapsed = time.time() - t0 if t0 else 0
     _log_req(f"{prefix}◀ ANTHROPIC {model_name} | {elapsed:.1f}s | nonstream done")
@@ -2175,6 +2193,7 @@ async def _stream_anthropic(
                 f"{prefix}↻ 网络错误（首字节前）| {model_name} | {type(e).__name__}: {e}"
                 f" | 自动重试 {attempt}/{retries}"
             )
+            await _retry_wait(attempt)
     if terminal:
         return
 
@@ -2429,11 +2448,19 @@ def main():
     ap.add_argument(
         "--stream-retry",
         type=int,
-        default=int(os.environ.get("CODEBUDDY2OPENAI_STREAM_RETRY", 1)),
+        default=int(os.environ.get("CODEBUDDY2OPENAI_STREAM_RETRY", 5)),
         metavar="N",
-        help="网络错误自动重试次数（默认 1，0 = 关闭）。只对**尚未向客户端发出任何"
+        help="网络错误自动重试次数（默认 5，0 = 关闭）。只对**尚未向客户端发出任何"
         "字节**的失败生效（建连失败 / 隧道抖动 / 上游在出首字节前重置）；"
         "已开始转发后再断流无法安全重试。也可用环境变量 CODEBUDDY2OPENAI_STREAM_RETRY。",
+    )
+    ap.add_argument(
+        "--stream-retry-gap",
+        type=float,
+        default=float(os.environ.get("CODEBUDDY2OPENAI_STREAM_RETRY_GAP", 2)),
+        metavar="SEC",
+        help="重试间隔基数（秒，默认 2），按 2^n 指数退避、封顶 30s；0 = 立即重试。"
+        "也可用环境变量 CODEBUDDY2OPENAI_STREAM_RETRY_GAP。",
     )
     ap.add_argument(
         "--ua-version",
@@ -2655,6 +2682,7 @@ def main():
     CONFIG["log_requests"] = bool(args.log_requests)
     CONFIG["log_bodies"] = bool(args.log_bodies)
     CONFIG["stream_retry"] = max(0, int(args.stream_retry))
+    CONFIG["stream_retry_gap"] = max(0.0, float(args.stream_retry_gap))
     af = find_auth_file(env_name)
     # 同目录多凭据 → 认领结果可能不是你想要的，明确警告而不是静默取值。
     _siblings = find_all_auth_files(env_name)

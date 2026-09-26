@@ -43,6 +43,7 @@ billing 域 UA 注意事项见 checkin.py 的模块 docstring：不显式设置 
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -67,6 +68,11 @@ BILLING_BASE = environments.base_for("billing")
 WEB_BASE = environments.base_for("web")
 
 DEFAULT_TIMEOUT = 60.0
+
+#: 网络异常自动重试（定时任务专用）：默认重试 5 次，间隔指数退避 2/4/8/16/30s（封顶 30s）。
+#: 可用环境变量覆盖：CODEBUDDY2OPENAI_TASK_RETRY / CODEBUDDY2OPENAI_TASK_RETRY_GAP。
+NET_RETRIES = max(0, int(os.environ.get("CODEBUDDY2OPENAI_TASK_RETRY", 5)))
+NET_RETRY_GAP = max(0.0, float(os.environ.get("CODEBUDDY2OPENAI_TASK_RETRY_GAP", 2)))
 
 #: 任务路径取账号时的预刷新窗口：与签到同口径（2h）。
 #: token 距过期不足 2h 就先刷，避免到点时已过期、整趟任务白跑。
@@ -245,18 +251,33 @@ def api_call(
 
     env / proxy 缺省时走 environments 的默认链（CODEBUDDY2OPENAI_ENV →
     凭据域/兜底 cn；代理取当前环境对应的 CODEBUDDY2OPENAI_PROXY_CN / _INTL）。
+
+    网络异常自动重试（2026-09-26 加）：定时任务一天只跑一两次，抖一下就丢掉
+    整个时段（实测 SSL EOF / timed out 把签到余额查询和猫旅行直接打挂），
+    所以这里比请求路径更激进 —— 间隔指数退避重试。只对**网络异常**重试；
+    HTTP 4xx/5xx 与业务错误码照旧原样返回，不重试。
     """
     url = base.rstrip("/") + path
     kwargs: dict = {"headers": headers}
     if body is not None:
         kwargs["json"] = body
-    try:
-        with environments.make_client(
-            env, proxy=proxy, timeout=timeout, transport=transport
-        ) as c:
-            r = c.request(method, url, **kwargs)
-    except Exception as e:  # noqa: BLE001 — 网络异常不该让调度线程崩
-        return ApiResult(False, -1, None, f"网络失败：{e}")
+    retries = max(0, NET_RETRIES)
+    r = None
+    for attempt in range(1, retries + 2):
+        try:
+            with environments.make_client(
+                env, proxy=proxy, timeout=timeout, transport=transport
+            ) as c:
+                r = c.request(method, url, **kwargs)
+            break
+        except Exception as e:  # noqa: BLE001 — 网络异常不该让调度线程崩
+            if attempt > retries:
+                return ApiResult(
+                    False, -1, None, f"网络失败：{e}（重试 {retries} 次后仍失败）"
+                )
+            gap = min(NET_RETRY_GAP * (2 ** (attempt - 1)), 30.0)
+            if gap > 0:
+                time.sleep(gap)
 
     code, msg, data = _parse_envelope(r.status_code, r.text)
     ok = r.status_code < 400 and code in (0, None)

@@ -153,7 +153,7 @@ def effective_cli_version() -> str:
 #: 为什么要拆开：image tag 若一直等于 2.155.0，`docker compose up -d` 会复用
 #: 旧镜像，改了代码不生效（踩过两次）；而 --no-cache 靠人记，迟早忘。
 #: tag 变了 Docker 自然新建镜像 —— 这才是版本号的本来目的。
-SERVICE_BUILD = 8
+SERVICE_BUILD = 9
 
 #: 对外版本串（包名 / 镜像 tag / 启动日志统一用这个）：
 #: `2.155.0-b2` = CLI 版本 + 服务构建号。单一真源仍是本文件，别处不得硬编码。

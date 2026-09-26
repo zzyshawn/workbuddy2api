@@ -85,8 +85,27 @@ def test_api_call_envelope_and_error_semantics():
     r2 = growth_api.api_call("https://x", "/p", {}, transport=_t(lambda req: httpx.Response(200, json={"code": 41000, "msg": "活动已结束"})))
     assert not r2.ok and r2.code == 41000 and "41000" in r2.summary()
 
+    # 网络异常：关闭重试（避免测试真的等退避），断言错误语义
+    growth_api.NET_RETRIES = 0
     r3 = growth_api.api_call("https://x", "/p", {}, transport=_t(lambda req: (_ for _ in ()).throw(httpx.ConnectError("no route"))))
-    assert not r3.ok and r3.status == -1 and "网络失败" in r3.msg
+    assert not r3.ok and r3.status == -1 and "网络失败" in r3.msg and "重试" in r3.msg
+
+    # 网络异常重试：第一次失败、第二次成功（gap=0 不等待）
+    growth_api.NET_RETRIES = 3
+    growth_api.NET_RETRY_GAP = 0.0
+    calls = {"n": 0}
+
+    def _flaky(req):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise httpx.ConnectError("boom")
+        return httpx.Response(200, json={"code": 0, "data": {"ok": 1}})
+
+    r4 = growth_api.api_call("https://x", "/p", {}, transport=_t(_flaky))
+    assert r4.ok and r4.data == {"ok": 1} and calls["n"] == 2
+
+    growth_api.NET_RETRIES = 5
+    growth_api.NET_RETRY_GAP = 2.0
     print("✅ test_api_call_envelope_and_error_semantics")
 
 
