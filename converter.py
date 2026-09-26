@@ -746,6 +746,11 @@ CONFIG: dict = {
     #: 完整报文开关（默认关）。打开后把发往后端的 body / 上游原始 SSE 全文落盘。
     #: 排障用，量很大；开着会把请求级日志重新淹掉。
     "log_bodies": False,
+    #: 网络错误自动重试次数（默认 1，0 = 关闭）。**只对「还没向客户端发出任何字节」
+    #: 的失败生效** —— 建连失败 / SOCKS 隧道抖动 / 上游在出首字节前重置。
+    #: 已开始转发后再断流不能重试（客户端已收到部分数据，重发会内容重复）；
+    #: 上游明确回非 200 也不重试（确定性拒绝，立刻重试结果一样）。
+    "stream_retry": 1,
 }
 # cred: CredentialManager | None；registry: ModelRegistry | None
 # checkin: CheckinScheduler | None（签到执行体，供 /admin/checkin 沿用旧结构）
@@ -1270,31 +1275,43 @@ async def chat_completions(
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    # 非流式：后端只支持流式，这里把后端 SSE 聚合成单个 chat.completion 响应
-    try:
-        async with environments.make_async_client(CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=300) as c:
-            async with c.stream("POST", url, headers=headers, json=body) as r:
-                if r.status_code != 200:
-                    raw = await r.aread()
-                    _log(
-                        f"[{rid}] ✗ HTTP {r.status_code} | {model_name} | {_truncate(raw.decode('utf-8', 'replace'), 200)}"
-                    )
-                    _log_body(f"[{rid}] ── ERROR BODY ──\n{raw.decode('utf-8', 'replace')}")
-                    raise HTTPException(
-                        status_code=r.status_code,
-                        detail=_safe_err_raw(raw, r.status_code),
-                    )
-                collected = await _collect_stream(r)
-    except HTTPException:
-        raise
-    except httpx.HTTPError as e:
-        _log(f"[{rid}] ✗ 网络错误 | {model_name} | {type(e).__name__}: {e}")
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "error": {"message": f"upstream error: {e}", "type": "upstream_error"}
-            },
-        )
+    # 非流式：后端只支持流式，这里把后端 SSE 聚合成单个 chat.completion 响应。
+    # 响应聚合完才返回给客户端 —— 任何时刻的网络错误都可以安全重试。
+    collected = None
+    retries = max(0, int(CONFIG.get("stream_retry", 1)))
+    for attempt in range(1, retries + 2):
+        try:
+            async with environments.make_async_client(CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=300) as c:
+                async with c.stream("POST", url, headers=headers, json=body) as r:
+                    if r.status_code != 200:
+                        raw = await r.aread()
+                        _log(
+                            f"[{rid}] ✗ HTTP {r.status_code} | {model_name} | {_truncate(raw.decode('utf-8', 'replace'), 200)}"
+                        )
+                        _log_body(f"[{rid}] ── ERROR BODY ──\n{raw.decode('utf-8', 'replace')}")
+                        raise HTTPException(
+                            status_code=r.status_code,
+                            detail=_safe_err_raw(raw, r.status_code),
+                        )
+                    collected = await _collect_stream(r)
+            break
+        except HTTPException:
+            raise
+        except httpx.HTTPError as e:
+            if attempt > retries:
+                _log(
+                    f"[{rid}] ✗ 网络错误 | {model_name} | {type(e).__name__}: {e}；重试后仍失败"
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "error": {"message": f"upstream error: {e}", "type": "upstream_error"}
+                    },
+                ) from None
+            _log(
+                f"[{rid}] ↻ 网络错误 | {model_name} | {type(e).__name__}: {e}"
+                f" | 自动重试 {attempt}/{retries}"
+            )
     _log_finish(model_name, t0, collected, rid)
     return JSONResponse(content=collected)
 
@@ -1580,8 +1597,18 @@ async def _stream_upstream(
             if filtered:
                 saw_filter = True
 
-    try:
-        async with environments.make_async_client(CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=None) as c:
+    # —— 网络错误自动重试 ——
+    # 规则（2026-09-26 定）：只有在**还没向客户端转发过任何字节**时失败才重试
+    # （建连失败 / SOCKS 隧道抖动 / 上游在出首字节前重置——正是线上见到的那种
+    # 「✗ 网络错误」。已开始转发后再断流，客户端已收到部分数据，重试会造成
+    # 内容重复，只能报错。上游明确回非 200 也不重试（确定性拒绝）。
+    terminal = False  # True = 非 200 的错误事件已发给客户端，直接结束
+
+    async def _attempt():
+        nonlocal terminal
+        async with environments.make_async_client(
+            CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=None
+        ) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     err = await r.aread()
@@ -1589,6 +1616,7 @@ async def _stream_upstream(
                         f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8', 'replace'), 200)}"
                     )
                     _log_body(f"{prefix}── ERROR BODY ──\n{err.decode('utf-8', 'replace')}")
+                    terminal = True
                     yield _err_event(err, r.status_code)
                     return
                 async for chunk in r.aiter_bytes():
@@ -1596,9 +1624,29 @@ async def _stream_upstream(
                         raw_parts.append(chunk)
                         _feed(chunk)
                         yield chunk
-    except httpx.HTTPError as e:
-        _log(f"{prefix}✗ 网络错误 | {model_name} | {type(e).__name__}: {e}")
-        yield _err_event(str(e).encode(), 502)
+
+    retries = max(0, int(CONFIG.get("stream_retry", 1)))
+    for attempt in range(1, retries + 2):
+        sent_any = False
+        try:
+            async for chunk in _attempt():
+                sent_any = True
+                yield chunk
+            break  # 正常走完
+        except httpx.HTTPError as e:
+            if sent_any or attempt > retries:
+                _log(
+                    f"{prefix}✗ 网络错误 | {model_name} | {type(e).__name__}: {e}"
+                    + ("；已转发部分数据，无法安全重试" if sent_any else "；重试后仍失败")
+                )
+                yield _err_event(str(e).encode(), 502)
+                return
+            _log(
+                f"{prefix}↻ 网络错误（首字节前）| {model_name} | {type(e).__name__}: {e}"
+                f" | 自动重试 {attempt}/{retries}"
+            )
+    if terminal:
+        return
 
     # 流结束：输出完成日志（成功行的记录随 --log-requests；内容审核拦截始终记）
     elapsed = time.time() - t0 if t0 else 0
@@ -1666,21 +1714,41 @@ def _chat_body_desensitize(body: dict, *, force_compact: bool = False) -> dict:
     )
 
 
-async def _post_backend_once(url: str, headers: dict, body: dict) -> tuple[int, bytes]:
-    async with environments.make_async_client(CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=120) as c:
-        async with c.stream("POST", url, headers=headers, json=body) as r:
-            chunks: list[bytes] = []
-            async for chunk in r.aiter_bytes():
-                if chunk:
-                    chunks.append(chunk)
-            return r.status_code, b"".join(chunks)
+async def _post_backend_once(
+    url: str, headers: dict, body: dict, *, rid: str = "", model_name: str = "?"
+) -> tuple[int, bytes]:
+    """单次请求后端并**缓冲完整响应**。
+
+    网络层失败自动重试（次数 = CONFIG["stream_retry"]）：本函数把响应整个缓冲完
+    才返回，调用方还没向客户端发出任何东西，重发是安全的。非 200 不重试
+    （那是确定性拒绝，交由调用方决定）。
+    """
+    prefix = f"[{rid}] " if rid else ""
+    retries = max(0, int(CONFIG.get("stream_retry", 1)))
+    for attempt in range(1, retries + 2):
+        try:
+            async with environments.make_async_client(CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=120) as c:
+                async with c.stream("POST", url, headers=headers, json=body) as r:
+                    chunks: list[bytes] = []
+                    async for chunk in r.aiter_bytes():
+                        if chunk:
+                            chunks.append(chunk)
+                    return r.status_code, b"".join(chunks)
+        except httpx.HTTPError as e:
+            if attempt > retries:
+                raise
+            _log(
+                f"{prefix}↻ 网络错误 | {model_name} | {type(e).__name__}: {e}"
+                f" | 自动重试 {attempt}/{retries}"
+            )
+    raise RuntimeError("unreachable")  # pragma: no cover
 
 
 async def _post_backend_with_filter_retry(
     url: str, headers: dict, body: dict, rid: str = "", model_name: str = "?"
 ) -> tuple[int, bytes, dict]:
     prefix = f"[{rid}] " if rid else ""
-    status, raw = await _post_backend_once(url, headers, body)
+    status, raw = await _post_backend_once(url, headers, body, rid=rid, model_name=model_name)
     text = raw.decode("utf-8", "replace")
     if (
         status == 200
@@ -1695,7 +1763,9 @@ async def _post_backend_with_filter_retry(
         _log_body(
             f"{prefix}── RESPONSES RETRY CHAT BODY ──\n{json.dumps(retry_body, ensure_ascii=False, indent=2)}"
         )
-        retry_status, retry_raw = await _post_backend_once(url, headers, retry_body)
+        retry_status, retry_raw = await _post_backend_once(
+            url, headers, retry_body, rid=rid, model_name=model_name
+        )
         retry_text = retry_raw.decode("utf-8", "replace")
         if retry_status == 200 and not _looks_like_content_filter_text(retry_text):
             return retry_status, retry_raw, retry_body
@@ -1993,37 +2063,49 @@ async def _collect_anthropic_nonstream(
     rid: str = "",
 ) -> dict:
     """收集完整的流式响应并返回非流式 Anthropic Message 对象。"""
-    converter = AnthropicStreamConverter(model=model_name)
     prefix = f"[{rid}] " if rid else ""
 
-    try:
-        async with environments.make_async_client(CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=120.0) as c:
-            async with c.stream("POST", url, headers=headers, json=body) as r:
-                if r.status_code != 200:
-                    err = await r.aread()
-                    _log(
-                        f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8', 'replace'), 200)}"
-                    )
-                    raise HTTPException(
-                        status_code=r.status_code,
-                        detail={
-                            "error": {
-                                "message": err.decode("utf-8", "replace")[:500],
-                                "type": "api_error",
-                                "code": r.status_code,
-                            }
-                        },
-                    )
-                async for line in r.aiter_lines():
-                    converter.feed_line(line)
-    except httpx.HTTPError as e:
-        _log(f"{prefix}✗ 网络错误 | {model_name} | {type(e).__name__}: {e}")
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "error": {"message": str(e)[:500], "type": "api_error", "code": 502}
-            },
-        ) from None
+    # 整个响应聚合完才返回给客户端 —— 网络错误可安全重试（converter 每次新建）。
+    retries = max(0, int(CONFIG.get("stream_retry", 1)))
+    converter = None
+    for attempt in range(1, retries + 2):
+        converter = AnthropicStreamConverter(model=model_name)
+        try:
+            async with environments.make_async_client(CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=120.0) as c:
+                async with c.stream("POST", url, headers=headers, json=body) as r:
+                    if r.status_code != 200:
+                        err = await r.aread()
+                        _log(
+                            f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8', 'replace'), 200)}"
+                        )
+                        raise HTTPException(
+                            status_code=r.status_code,
+                            detail={
+                                "error": {
+                                    "message": err.decode("utf-8", "replace")[:500],
+                                    "type": "api_error",
+                                    "code": r.status_code,
+                                }
+                            },
+                        )
+                    async for line in r.aiter_lines():
+                        converter.feed_line(line)
+            break
+        except httpx.HTTPError as e:
+            if attempt > retries:
+                _log(
+                    f"{prefix}✗ 网络错误 | {model_name} | {type(e).__name__}: {e}；重试后仍失败"
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "error": {"message": str(e)[:500], "type": "api_error", "code": 502}
+                    },
+                ) from None
+            _log(
+                f"{prefix}↻ 网络错误 | {model_name} | {type(e).__name__}: {e}"
+                f" | 自动重试 {attempt}/{retries}"
+            )
 
     elapsed = time.time() - t0 if t0 else 0
     _log_req(f"{prefix}◀ ANTHROPIC {model_name} | {elapsed:.1f}s | nonstream done")
@@ -2038,39 +2120,62 @@ async def _stream_anthropic(
     t0: float = 0.0,
     rid: str = "",
 ):
-    """消费后端 OpenAI Chat SSE，实时转换为 Anthropic Messages SSE 事件流。"""
-    converter = AnthropicStreamConverter(model=model_name)
-    prefix = f"[{rid}] " if rid else ""
+    """消费后端 OpenAI Chat SSE，实时转换为 Anthropic Messages SSE 事件流。
 
-    try:
-        async with environments.make_async_client(CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=None) as c:
-            async with c.stream("POST", url, headers=headers, json=body) as r:
-                if r.status_code != 200:
-                    err = await r.aread()
-                    _log(
-                        f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8', 'replace'), 200)}"
-                    )
-                    error_evt = {
-                        "type": "error",
-                        "error": {
-                            "message": err.decode("utf-8", "replace")[:500],
-                            "type": "api_error",
-                            "code": r.status_code,
-                        },
-                    }
-                    yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
-                    return
-                async for line in r.aiter_lines():
-                    events = converter.feed_line(line)
-                    if events:
-                        yield events.encode("utf-8")
-    except httpx.HTTPError as e:
-        _log(f"{prefix}✗ 网络错误 | {model_name} | {type(e).__name__}: {e}")
-        error_evt = {
-            "type": "error",
-            "error": {"message": str(e)[:500], "type": "api_error", "code": 502},
-        }
-        yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
+    网络错误自动重试（与 _stream_upstream 同规则）：只在**还没向客户端发出任何
+    字节**时重试。converter 每次尝试都新建 —— feed_line 可能已缓冲事件但尚未吐出，
+    复用旧实例会把上一次尝试的状态带进来。
+    """
+    prefix = f"[{rid}] " if rid else ""
+    terminal = False  # True = 非 200 的错误事件已发给客户端
+    converter = None
+
+    retries = max(0, int(CONFIG.get("stream_retry", 1)))
+    for attempt in range(1, retries + 2):
+        sent_any = False
+        converter = AnthropicStreamConverter(model=model_name)
+        try:
+            async with environments.make_async_client(CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=None) as c:
+                async with c.stream("POST", url, headers=headers, json=body) as r:
+                    if r.status_code != 200:
+                        err = await r.aread()
+                        _log(
+                            f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8', 'replace'), 200)}"
+                        )
+                        error_evt = {
+                            "type": "error",
+                            "error": {
+                                "message": err.decode("utf-8", "replace")[:500],
+                                "type": "api_error",
+                                "code": r.status_code,
+                            },
+                        }
+                        terminal = True
+                        yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
+                        break
+                    async for line in r.aiter_lines():
+                        events = converter.feed_line(line)
+                        if events:
+                            sent_any = True
+                            yield events.encode("utf-8")
+            break  # 正常走完
+        except httpx.HTTPError as e:
+            if sent_any or attempt > retries:
+                _log(
+                    f"{prefix}✗ 网络错误 | {model_name} | {type(e).__name__}: {e}"
+                    + ("；已转发部分数据，无法安全重试" if sent_any else "；重试后仍失败")
+                )
+                error_evt = {
+                    "type": "error",
+                    "error": {"message": str(e)[:500], "type": "api_error", "code": 502},
+                }
+                yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
+                return
+            _log(
+                f"{prefix}↻ 网络错误（首字节前）| {model_name} | {type(e).__name__}: {e}"
+                f" | 自动重试 {attempt}/{retries}"
+            )
+    if terminal:
         return
 
     finish_events = converter.finish()
@@ -2322,6 +2427,15 @@ def main():
         "排障用，量很大；也可用环境变量 CODEBUDDY2OPENAI_LOG_BODIES=1。默认关闭。",
     )
     ap.add_argument(
+        "--stream-retry",
+        type=int,
+        default=int(os.environ.get("CODEBUDDY2OPENAI_STREAM_RETRY", 1)),
+        metavar="N",
+        help="网络错误自动重试次数（默认 1，0 = 关闭）。只对**尚未向客户端发出任何"
+        "字节**的失败生效（建连失败 / 隧道抖动 / 上游在出首字节前重置）；"
+        "已开始转发后再断流无法安全重试。也可用环境变量 CODEBUDDY2OPENAI_STREAM_RETRY。",
+    )
+    ap.add_argument(
         "--ua-version",
         default=os.environ.get("CODEBUDDY2OPENAI_UA_VERSION") or None,
         metavar="VER",
@@ -2540,6 +2654,7 @@ def main():
     )
     CONFIG["log_requests"] = bool(args.log_requests)
     CONFIG["log_bodies"] = bool(args.log_bodies)
+    CONFIG["stream_retry"] = max(0, int(args.stream_retry))
     af = find_auth_file(env_name)
     # 同目录多凭据 → 认领结果可能不是你想要的，明确警告而不是静默取值。
     _siblings = find_all_auth_files(env_name)
