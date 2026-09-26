@@ -805,6 +805,18 @@ def _truncate(s: str, n: int = 80) -> str:
     return s[:n] + ("…" if len(s) > n else "")
 
 
+def _upstream_timeout(read) -> httpx.Timeout:
+    """上游 httpx 客户端超时：connect/pool 快速失败，read 按路径单独给。
+
+    为什么：2026-09-26 排查「新会话第一遍没反应、要问两遍」发现，流式路径
+    `timeout=None` 意味着**连接阶段也没有超时** —— TLS 握手经代理挂死时，
+    服务端无限傻等，而客户端有自己的首字节超时，等不到任何字节就放弃重发，
+    表现就是「第一遍只是联通了一下」。connect 限时快速失败后交给重试循环；
+    read 不能限（SSE 长流，思考模型出首字节前后间隔可达数分钟）。
+    """
+    return httpx.Timeout(connect=15.0, read=read, write=30.0, pool=15.0)
+
+
 async def _retry_wait(attempt: int) -> None:
     """第 attempt 次（从 1 计）网络失败后的退避等待。
 
@@ -1295,7 +1307,7 @@ async def chat_completions(
     retries = max(0, int(CONFIG.get("stream_retry", 1)))
     for attempt in range(1, retries + 2):
         try:
-            async with environments.make_async_client(CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=300) as c:
+            async with environments.make_async_client(CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=_upstream_timeout(300)) as c:
                 async with c.stream("POST", url, headers=headers, json=body) as r:
                     if r.status_code != 200:
                         raw = await r.aread()
@@ -1622,7 +1634,7 @@ async def _stream_upstream(
     async def _attempt():
         nonlocal terminal
         async with environments.make_async_client(
-            CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=None
+            CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=_upstream_timeout(None)
         ) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
@@ -1743,7 +1755,7 @@ async def _post_backend_once(
     retries = max(0, int(CONFIG.get("stream_retry", 1)))
     for attempt in range(1, retries + 2):
         try:
-            async with environments.make_async_client(CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=120) as c:
+            async with environments.make_async_client(CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=_upstream_timeout(120)) as c:
                 async with c.stream("POST", url, headers=headers, json=body) as r:
                     chunks: list[bytes] = []
                     async for chunk in r.aiter_bytes():
@@ -2088,7 +2100,7 @@ async def _collect_anthropic_nonstream(
     for attempt in range(1, retries + 2):
         converter = AnthropicStreamConverter(model=model_name)
         try:
-            async with environments.make_async_client(CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=120.0) as c:
+            async with environments.make_async_client(CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=_upstream_timeout(120.0)) as c:
                 async with c.stream("POST", url, headers=headers, json=body) as r:
                     if r.status_code != 200:
                         err = await r.aread()
@@ -2153,7 +2165,7 @@ async def _stream_anthropic(
         sent_any = False
         converter = AnthropicStreamConverter(model=model_name)
         try:
-            async with environments.make_async_client(CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=None) as c:
+            async with environments.make_async_client(CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=_upstream_timeout(None)) as c:
                 async with c.stream("POST", url, headers=headers, json=body) as r:
                     if r.status_code != 200:
                         err = await r.aread()
