@@ -33,10 +33,11 @@
 #       缺目录时项目启动直接报 `Bind mount failed`。先在 File Station 建好。
 #
 # 2) 凭据怎么放 —— **国内版和国际版一定要分开放**：
-#      auth/cn/workbuddy-desktop.info                <- 国内版
+#      auth/cn/Tencent-Cloud.coding-copilot.info     <- 国内版（2026-09-28 起，
+#        workbuddy-desktop.info 已被桌面端加密改版不可用；国内域明文凭据以
+#        桌面端 Tencent-Cloud.coding-copilot.info 为准，见 cn 实例注释）
 #      auth/intl/Tencent-Cloud.coding-copilot.info   <- 国际版
-#    两个环境是**两个不同账号的两份 token**，混在一个目录会随机取错 -> 全链路 401。
-#    （只用一个环境时，直接丢 auth/ 根目录也行，容器会按 auth.domain 自动认领。）
+#    两个环境是**两个 realm 的两份 token**，混在一个目录会随机取错 -> 全链路 401。
 #
 # 3) 凭据从电脑哪里复制：
 #      Windows: %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\
@@ -46,135 +47,76 @@
 # 4) 启动（SSH 到群晖后，在代码目录里）：
 #      sudo docker-compose up -d --build       # 旧版
 #      sudo docker compose up -d --build       # Docker Compose v2
-#    验证：
-#      curl http://127.0.0.1:8787/health
-#      curl http://<群晖IP>:8787/v1/models
+#    验证（双实例各查各的）：
+#      curl http://127.0.0.1:8787/health       # intl（codebuddy.ai，uid 18d455b9…）
+#      curl http://127.0.0.1:8790/health       # cn  （codebuddy.cn，uid 0f6d6ce4…）
 #    日志：
 #      sudo docker compose logs -f
-#      tail -f logs/converter.log
+#      tail -f logs/converter-intl.log logs/converter-cn.log
 #
+# ===========================================================================
+# 双实例架构（2026-09-28）：
+#   - intl 实例：反代 + 任务都对着国际域（codebuddy.ai realm），走东京代理；
+#   - cn   实例：反代 + 任务都对着国内域（codebuddy.cn realm），家里直连；
+#   - 两个实例 = 两个反代端点，各自上游域，互不冲突（一个进程/实例只绑一个域）。
 # ===========================================================================
 
 services:
-  workbuddy2api:
+  # ===========================================================================
+  # 实例 1：国际版（codebuddy.ai realm）
+  # ===========================================================================
+  workbuddy2api-intl:
     build:
-      # —— 方式 A：从源码目录构建（群晖只能这样，见下方说明）——
+      # —— 方式 A：从源码目录构建（群晖只能这样）——
       context: .
       dockerfile: Dockerfile
 
-      # —— 方式 B：直接从 tar 包构建 ——
-      # 包名带版本，版本与 CodeBuddy CLI 对齐（见 model_registry.CLI_UA_VERSION）：
-      #   wb2api-<版本>.tar.gz   例如 wb2api-2.155.0.tar.gz
-      #
-      # ⚠️ 群晖 Container Manager **不支持** .tar.gz 作为 build context，
-      #    写 `context: ./wb2api-2.155.0.tar.gz` 会直接报：
-      #      unable to prepare context: context must be a directory
-      #    （实测。群晖的构建器不认 tar context，只认目录。）
-      #
-      #    要在群晖上用 tar 包，只有两条路：
-      #      a) 本地先 `pack_for_nas.py --extract` 解出目录，把**目录**拷过去（推荐）；
-      #      b) 把 tar 包拷到群晖后，先 `tar -xzf wb2api-2.155.0.tar.gz -C src/` 再构建。
-      #
-      # context: ./wb2api-src
-      # dockerfile: Dockerfile
-      #
-      # 普通 Linux 主机（非群晖）的 Docker 是**原生支持** tar context 的：
-      # context: ./wb2api-2.155.0.tar.gz
-      # Docker 会自动解压到临时目录，不需要先解压。
-      # 包内必须是「扁平结构」（Dockerfile 在包根）。
-      #
-      # 注意：无论用哪种方式，下方的 volume 路径都不变，
-      # 所以 auth/ 和 logs/ 还是要在部署目录里建（包只管代码，不管数据）。
-
-    # 镜像 tag 带版本（与 CodeBuddy CLI 对齐；见 model_registry.CLI_UA_VERSION）。
-    # 为什么不用 `:latest`：固定 tag 会让 `up -d` 直接复用旧镜像、**掩盖重建**，
-    # 表现为「改了环境变量没生效」。带版本号后，换了包就必须改这一行 ↓，
-    # 改了就一定触发新镜像，`docker images` 里也能一眼看出跑的是哪版。
     # 镜像 tag = model_registry.SERVICE_VERSION（CLI 版本 + 服务构建号）。
     # ⚠️ 服务代码每次实质变更必须 bump model_registry.SERVICE_BUILD 并同步改这行
-    # —— tag 变了 docker compose up -d 才会重建；tag 不变会静默复用旧镜像（踩过两次）。
+    # —— tag 不变会静默复用旧镜像（踩过两次）。
     image: workbuddy2api:2.158.0-b10
-    container_name: workbuddy2api
+    container_name: workbuddy2api-intl
 
     ports:
       - "8787:8787"
-      # 只想在本机（群晖自身）访问、不暴露到局域网时，改成：
-      # - "127.0.0.1:8787:8787"
-      # 一旦要暴露到局域网，**务必**设置下面的 CODEBUDDY2OPENAI_KEY，
-      # 否则同网段任何人都能白嫖你的账号额度。
-      #
-      # ⚠️ 注意：/health **不参与鉴权**（它是公开端点，供 healthcheck 用），
-      #    且会回显你的 uid / 昵称 / 企业名 / 凭据文件路径。
-      #    介意的话就别把端口暴露到局域网，或在群晖防火墙里只放行可信来源。
+      # 暴露到局域网前**务必**设置 CODEBUDDY2OPENAI_KEY。
+      # ⚠️ /health 不参与鉴权，且会回显 uid / 昵称 / 凭据路径，别裸奔到公网。
 
     volumes:
-      # 【必须可写，不要加 :ro】
-      # converter.py 在 token 临近过期时会用 os.replace() 原子回写 auth 文件
-      # （见 CredentialManager._refresh）。只读挂载会导致刷新失败 -> 后端 401。
-      # 另外要挂「目录」而不是单个 .info 文件，否则容器内 rename 会报 busy。
-      #
-      # ★ 群晖请用**绝对路径**（./ 相对路径在 Container Manager 里容易解析错）：
+      # 【必须可写，不要加 :ro】converter 会原子回写 auth 文件（token 刷新）。
+      # 挂「目录」而不是单个 .info 文件，否则容器内 rename 会报 busy。
+      # ★ 群晖请用**绝对路径**：
       - "/volume1/docker/workbuddy2api/auth:/data/auth"
       - "/volume1/docker/workbuddy2api/logs:/logs"
-      #
-      # 注意：若群晖上凭据目录属主不是 root，容器内（root 运行）能写，
-      # 但宿主机上的桌面端可能读不了。反过来也一样。必要时统一属主：
-      #   sudo chown -R 1026:100 /volume1/docker/workbuddy2api/auth   # 群晖常见 uid:gid
 
     environment:
-      # ---- 凭据目录（容器内路径，与上面的 volume 对应）----
       - CODEBUDDY_AUTH_DIR=/data/auth
 
-      # ---- 环境选择：cn(国内版) / intl(国际版) / auto ----
-      # auto = 从 auth/ 下读凭据的 auth.domain 自动判定，推荐
-      - CODEBUDDY2OPENAI_ENV=auto
+      # ---- 环境锁定 intl：双实例下各自认准自己的凭据，不靠 auto 推断 ----
+      - CODEBUDDY2OPENAI_ENV=intl
+      - CODEBUDDY2OPENAI_AUTH_INTL=/data/auth/intl/Tencent-Cloud.coding-copilot.info
 
-      # ---- 分环境代理（可选；直连无障碍就别填）----
-      # 只给国际版配代理、国内版直连，是最常见也最快的组合。
-      # 支持 http:// 与 socks5://（socks5 需要镜像里的 httpx[socks]，requirements 已含）。
-      # - CODEBUDDY2OPENAI_PROXY_INTL=http://192.168.1.100:7890
-      # - CODEBUDDY2OPENAI_PROXY_CN=
-      # 两个环境都用同一个代理时的兜底（优先级低于上面两个）：
-      # - CODEBUDDY2OPENAI_PROXY=http://192.168.0.100:7890
-
-      # ---- 分环境凭据的显式指定（可选，一般用不到）----
-      # 优先级高于 CODEBUDDY_AUTH_DIR。只想覆盖其中一个环境时特别有用：
-      # - CODEBUDDY2OPENAI_AUTH_CN=/data/auth/cn/workbuddy-desktop.info
-      # - CODEBUDDY2OPENAI_AUTH_INTL=/data/auth/intl/Tencent-Cloud.coding-copilot.info
+      # ---- 国际域代理（东京 VPS SOCKS5）----
+      # 签到/对话都是 HTTPS over TCP，代理只需支持 TCP 转发；
+      # httpx 的 socks5 不做 UDP ASSOCIATE，UDP 配了也没用。
+      # - CODEBUDDY2OPENAI_PROXY_INTL=socks5://user:pass@192.168.1.100:1080
 
       # ---- 本地 API 鉴权 ----
-      # 留空 = 不校验。暴露到局域网前请务必填一个足够长的随机串。
       - CODEBUDDY2OPENAI_KEY=
-      # 等价于 --log
-      - CODEBUDDY2OPENAI_LOG=/logs/converter.log
-      # ---- 日志详细度（可选）----
-      # 默认只记错误/异常：401、上游非 200、网络错误、任务告警 —— 量很小。
-      # 想看「每次调了哪个模型、返回什么状态」时打开下面这行（每请求 1~2 行）：
+      # 日志/快照按实例分文件，避免互覆
+      - CODEBUDDY2OPENAI_LOG=/logs/converter-intl.log
+      - CODEBUDDY2OPENAI_STATE_FILE=/logs/state-intl.json
+      # 默认只记错误/异常；排障再开：
       # - CODEBUDDY2OPENAI_LOG_REQUESTS=1
-      # 排障时想看完整报文（发往后端的 body / 上游原始 SSE 全文）再开这行，量很大：
       # - CODEBUDDY2OPENAI_LOG_BODIES=1
 
       # ---- 上游 UA 版本（可选）----
-      # 对上游声明 CLI/<ver> CodeBuddy/<ver> 的版本号。上游只校验 UA 形态、不校验版本号，
-      # 所以 CodeBuddy CLI 出新版本时不用改代码重新打包。两种方式：
-      #   ① 版本文件（推荐，热生效）：logs/ 目录下建一个 ua-version.txt，
-      #      内容写一行如 2.159.0，File Station 保存后下一个请求即用新版本，
-      #      无需重启/重建容器；清空文件 = 恢复内置默认。
-      #   ② 环境变量（要重建容器才生效）：
+      # ① 版本文件（推荐，热生效）：logs/ua-version.txt，清空 = 恢复内置默认。
+      # ② 环境变量（要重建容器才生效）：
       # - CODEBUDDY2OPENAI_UA_VERSION=2.158.0
 
-      # ---- 状态快照（logs/state.json）----
-      # 落盘「当前可用模型 + 积分余额 + 任务状态」，不用翻日志就能查。
-      # 路径**默认跟着 CODEBUDDY2OPENAI_LOG 走**（日志文件所在目录），
-      # 所以这里什么都不用配 —— logs/ 已经挂好了，文件自然出现在里面。
-      # 需要换位置/换频率时再打开下面两行：
-      # - CODEBUDDY2OPENAI_STATE_FILE=/logs/state.json   # 也可给目录
-      # - CODEBUDDY2OPENAI_STATE_INTERVAL=1800           # 秒；0 = 只在事件时刷新
-
       - PYTHONUNBUFFERED=1
-
-      # 【六类定时任务按容器时区判定整点】务必留 Asia/Shanghai，
-      # 否则 09:00 签到会按 UTC（17:00）触发。夜猫窗口 23:00–08:00 同理。
+      # 【六类定时任务按容器时区判定整点】务必留 Asia/Shanghai
       - TZ=Asia/Shanghai
 
       # ---- 六类任务时点与开关（缺省即默认值，按需打开注释改写）----
@@ -186,7 +128,6 @@ services:
       # - CODEBUDDY2OPENAI_CAT_HOURS=1              # 夜猫子任务
       # - CODEBUDDY2OPENAI_ACTIVITY_REPORT_COUNT=5  # 每次活跃上报条数
 
-    # 覆盖 Dockerfile 的默认 CMD：打开脱敏与日志，去掉 --skip-check 以便打印预检信息
     command:
       - python3
       - converter.py
@@ -195,7 +136,7 @@ services:
       - --port
       - "8787"
       - --log
-      - /logs/converter.log
+      - /logs/converter-intl.log
       # 脱敏：压缩回溯上下文里的 Codex / Claude 脚手架指令。
       # 若发现模型表现异常（丢工具调用、不认上下文），先注释掉这行再排查。
       - --desensitize
@@ -212,4 +153,70 @@ services:
       start_period: 20s
 
     # 群晖上建议 unless-stopped：开机自启，手动停掉后不会自己又起来
+    restart: unless-stopped
+
+  # ===========================================================================
+  # 实例 2：国内版（codebuddy.cn realm）—— 2026-09-28 新增
+  #
+  # 背景：workbuddy-desktop.info 被 WorkBuddy 桌面端 09-28 升级改成
+  # `$wbEncrypted` 信封加密（AES-256-GCM，keyId 9127dea1b44020a7，密钥只在
+  # 桌面端内存/daemon 分发，不落盘），旧明文 token 也随桌面端刷新被轮换吊销
+  # → 签到全 401。
+  #
+  # 恢复凭据 = 桌面端 Tencent-Cloud.coding-copilot.info（09-26 刷新，
+  # 国内域 codebuddy.cn realm 的**明文** JWT，uid 0f6d6ce4…，
+  # 实测 streak/余额/签到接口全 200）。放到 auth/cn/ 下即可。
+  #
+  # 风险提示：桌面端下次在 codebuddy.cn realm 刷新登录时可能再次轮换吊销
+  # 这份 token。cn 实例自身会凭 refreshToken 续期并回写文件（独立会话），
+  # 正常可自持；若再度 401，重新从桌面端拷一份最新明文文件即可。
+  # ===========================================================================
+  workbuddy2api-cn:
+    image: workbuddy2api:2.158.0-b10
+    container_name: workbuddy2api-cn
+
+    ports:
+      - "8790:8787"
+
+    volumes:
+      # 与 intl 实例共用同一个 auth/ 父目录，靠 env 指向各自子目录
+      - "/volume1/docker/workbuddy2api/auth:/data/auth"
+      - "/volume1/docker/workbuddy2api/logs:/logs"
+
+    environment:
+      - CODEBUDDY_AUTH_DIR=/data/auth
+      - CODEBUDDY2OPENAI_ENV=cn
+      - CODEBUDDY2OPENAI_AUTH_CN=/data/auth/cn/Tencent-Cloud.coding-copilot.info
+      # 国内域家里直连即可，不配代理；要配时用：
+      # - CODEBUDDY2OPENAI_PROXY_CN=
+
+      - CODEBUDDY2OPENAI_KEY=
+      - CODEBUDDY2OPENAI_LOG=/logs/converter-cn.log
+      - CODEBUDDY2OPENAI_STATE_FILE=/logs/state-cn.json
+
+      - PYTHONUNBUFFERED=1
+      - TZ=Asia/Shanghai
+
+    command:
+      - python3
+      - converter.py
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8787"
+      - --log
+      - /logs/converter-cn.log
+      - --desensitize
+
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=3).status==200 else 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
     restart: unless-stopped
