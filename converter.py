@@ -33,6 +33,7 @@ from pathlib import Path
 import httpx
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 try:
@@ -721,6 +722,62 @@ PASSTHROUGH_BODY_KEYS = {
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="codebuddy2openai", version="2.0")
+
+
+def _cors_kwargs(origins: list[str]) -> dict:
+    """CORSMiddleware 的统一参数。鉴权走 Bearer/api-key 头、不用 cookie，
+    所以 allow_credentials 必须 False（True 与 "*" 组合会被浏览器直接拒绝）。"""
+    return {
+        "allow_origins": origins,
+        "allow_methods": ["*"],
+        "allow_headers": ["*"],
+        "allow_credentials": False,
+    }
+
+
+# ---------------------------------------------------------------------------
+# CORS（浏览器直连支持）
+# ---------------------------------------------------------------------------
+# 浏览器网页直连本服务时，跨域请求前会先发 OPTIONS 预检；没有这段时预检
+# 落不到任何路由 → 405，浏览器随即把真正的 POST 拦下，表现为「请求根本
+# 没发出去」（2026-10-07 cn 实例实测）。服务端程序（New API / Codex）不发
+# 预检，所以此前只在浏览器场景现形。
+#
+# 注册时机：必须在下方 `@app.middleware("http")` 访问日志**之前**。本 starlette
+# 版本的 add_middleware 是 insert(0)（后注册者更外层），所以访问日志在外、
+# CORS 在内、紧贴路由——预检 OPTIONS 由 CORS 直接短路（不再 405），日志里
+# 只会以 2xx 出现（默认静默，log_requests 开启时可见）。
+#
+# 默认全放行（`*`）：鉴权靠 KEY 而非 cookie，CORS 只约束浏览器、不影响
+# curl / SDK。需要收窄或禁用时用 --cors-origins / CODEBUDDY2OPENAI_CORS_ORIGINS
+# （见 _apply_cors_config）。
+app.add_middleware(CORSMiddleware, **_cors_kwargs(["*"]))
+
+
+def _apply_cors_config(spec: str) -> None:
+    """按 --cors-origins / CODEBUDDY2OPENAI_CORS_ORIGINS 重设 CORS 中间件。
+
+    spec：`*`（全放行）| `off`（禁用，恢复无 CORS 行为）| 逗号分隔来源列表。
+    直接改 user_middleware 而不是 add_middleware：后者在应用启动过一次后
+    （TestClient / lifespan）会抛 "Cannot add middleware after an application
+    has started"；直接构造 Middleware 无此限制，且语义完全等价。
+    只能在服务启动前调用（uvicorn.run 之前）；重挂后固定放列表末尾
+    （最内层、紧贴路由），与默认注册的顺序一致。
+    """
+    from starlette.middleware import Middleware
+
+    spec = (spec or "").strip()
+    app.user_middleware = [
+        m for m in app.user_middleware if m.cls is not CORSMiddleware
+    ]
+    if spec in ("", "off"):
+        return
+    origins = (
+        ["*"]
+        if spec == "*"
+        else [o.strip() for o in spec.split(",") if o.strip()]
+    )
+    app.user_middleware.append(Middleware(CORSMiddleware, **_cors_kwargs(origins)))
 CONFIG: dict = {
     "api_key": "",
     "cred": None,
@@ -2506,6 +2563,14 @@ def main():
         "设 0 表示只在事件发生时刷新（启动 / 模型刷新 / 任务跑完）。",
     )
     ap.add_argument(
+        "--cors-origins",
+        default=os.environ.get("CODEBUDDY2OPENAI_CORS_ORIGINS"),
+        metavar="SPEC",
+        help="浏览器直连的 CORS 允许来源：* 全放行（默认）、off 禁用、"
+        "或逗号分隔来源列表（如 https://a.example,https://b.example）。"
+        "也可用环境变量 CODEBUDDY2OPENAI_CORS_ORIGINS。",
+    )
+    ap.add_argument(
         "--desensitize",
         action="store_true",
         help="启用脱敏：对 system 消息里的合规模板敏感词（DoS/exploit/credential 等）"
@@ -2687,6 +2752,9 @@ def main():
     CONFIG["api_key"] = args.api_key
     CONFIG["desensitize"] = args.desensitize
     CONFIG["no_compact"] = args.no_compact
+    # CORS 收窄/禁用（默认全放行，见 app 定义处的说明）；未指定时保持默认
+    if args.cors_origins is not None:
+        _apply_cors_config(args.cors_origins)
     # --log 直接指定文件路径即开启；不传则不记
     CONFIG["log_path"] = (
         args.log if args.log else os.environ.get("CODEBUDDY2OPENAI_LOG")
