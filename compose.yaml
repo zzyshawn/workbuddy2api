@@ -112,6 +112,12 @@ services:
       # - CODEBUDDY2OPENAI_LOG_REQUESTS=1
       # - CODEBUDDY2OPENAI_LOG_BODIES=1
 
+      # ---- 网络错误自动重试次数（默认 5）----
+      # 2026-10-07 22:47 实测一次 ≥2.5min 的 SOCKS5 抖动刚好超出 5 次窗口（~2.5min），
+      # 改 10 次后总窗口 ~6min（15s connect ×10 + 指数退避封顶 30s）。
+      # ConnectTimeout 阶段连接未建立、上游无感，加次无限流风险。
+      - CODEBUDDY2OPENAI_STREAM_RETRY=10
+
       # ---- 上游 UA 版本（可选）----
       # ① 版本文件（推荐，热生效）：logs/ua-version.txt，清空 = 恢复内置默认。
       # ② 环境变量（要重建容器才生效）：
@@ -195,6 +201,8 @@ services:
       - CODEBUDDY2OPENAI_KEY=
       - CODEBUDDY2OPENAI_LOG=/logs/converter-cn.log
       - CODEBUDDY2OPENAI_STATE_FILE=/logs/state-cn.json
+      # 网络错误自动重试次数（默认 5），与 intl 实例对齐为 10（窗口 ~6min）
+      - CODEBUDDY2OPENAI_STREAM_RETRY=10
 
       - PYTHONUNBUFFERED=1
       - TZ=Asia/Shanghai
