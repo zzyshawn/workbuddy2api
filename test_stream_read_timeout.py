@@ -31,12 +31,12 @@ import converter  # noqa: E402
 
 
 def test_idle_timeout_default():
-    """流式（read=None）→ 空闲超时默认 600s。"""
+    """流式（read=None）→ 空闲超时默认 120s（用户拍板：宁快速失败不挂死）。"""
     saved = converter.CONFIG.get("stream_read_timeout")
-    converter.CONFIG["stream_read_timeout"] = 600.0
+    converter.CONFIG["stream_read_timeout"] = 120.0
     try:
         t = converter._upstream_timeout(None)
-        assert t.read == 600.0, f"read 应为 600，实际 {t.read}"
+        assert t.read == 120.0, f"read 应为 120，实际 {t.read}"
         assert t.connect == 15.0, "connect 超时不应被改动"
     finally:
         if saved is None:
@@ -69,9 +69,9 @@ def test_zero_disables():
 
 
 def test_control_endpoint():
-    """control 端点：200 {"ok": true}，双前缀都注册。"""
+    """control 端点：200 {"ok": true}，双前缀都注册，载荷落日志。"""
     client = TestClient(converter.app)
-    r = client.post("/v1/chat/completions/control")
+    r = client.post("/v1/chat/completions/control", json={"action": "stop"})
     assert r.status_code == 200, f"应 200，实际 {r.status_code}"
     assert r.json() == {"ok": True}, f"应 {{'ok': True}}，实际 {r.json()}"
     r2 = client.post("/chat/completions/control")

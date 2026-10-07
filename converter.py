@@ -814,7 +814,7 @@ CONFIG: dict = {
     #: 流式上游 read 空闲超时（秒）：两次字节之间的最大间隔。SOCKS5 隧道静默
     #: 死亡（TCP 半开）时 read 会永远阻塞，客户端停在「等待模型响应」；
     #: 600s 内一个字节都没有基本可断定链路死了。0 = 不限（恢复旧行为）。
-    "stream_read_timeout": 600.0,
+    "stream_read_timeout": 120.0,
 }
 # cred: CredentialManager | None；registry: ModelRegistry | None
 # checkin: CheckinScheduler | None（签到执行体，供 /admin/checkin 沿用旧结构）
@@ -875,11 +875,12 @@ def _upstream_timeout(read) -> httpx.Timeout:
     表现就是「第一遍只是联通了一下」。connect 限时快速失败后交给重试循环。
 
     read 超时的语义是 httpx 的 socket 级 read —— **两次字节之间的最大间隔**
-    （不是总时长），所以流式路径给一个较大的空闲超时（默认 600s）而不是 None：
+    （不是总时长），所以流式路径给一个较小的空闲超时（默认 120s）而不是 None：
     2026-10-07 排查「国际版经常卡在等待模型响应（31m14s）」发现，SOCKS5 隧道
-    静默死亡（TCP 半开）时 read 永远阻塞，客户端就一直转圈。深度思考模型
-    正常也会持续吐 reasoning delta，10 分钟一个字节都没有基本可断定链路死了，
-    主动断开报错好过永远挂住。传 None 仍表示不限（显式禁用）。
+    静默死亡（TCP 半开）时 read 永远阻塞，客户端就一直转圈。权衡：上游深度
+    思考期间若超过 2 分钟没有任何字节（含 reasoning delta）会被误断——误断的
+    表现是本次生成报错、客户端重发即可；而不设超时的表现是永久挂死。宁可
+    快速失败也不挂死，用户拍板 120s。传 None 仍表示不限（显式禁用）。
     """
     if read is None:
         v = CONFIG.get("stream_read_timeout")
@@ -1263,6 +1264,7 @@ def admin_tasks_run(
 @app.post("/chat/completions/control")
 @app.post("/v1/chat/completions/control")
 async def chat_completions_control(
+    request: Request,
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-Api-Key"),
     api_key: str | None = Header(default=None, alias="api-key"),
@@ -1272,10 +1274,20 @@ async def chat_completions_control(
     某些 node 客户端（ua=node）在流式对话期间会向
     `/v1/chat/completions/control` 发控制请求（中断/心跳类）。此前 404，
     客户端可能因拿不到应答而停在「等待模型响应」。这里最小实现：鉴权后
-    返回 200 空对象，不携带任何状态——真实控制语义（如中断生成）等观察
-    到客户端的具体载荷再补。鉴权失败照常 401，与主对话端点一致。
+    返回 200 空对象——真实控制语义（如中断生成）等日志抓到客户端的具体
+    载荷后再补。鉴权失败照常 401，与主对话端点一致。
+
+    载荷记录：无论有无 body 都落一行日志（摘要截断 160 字符），
+    完整 body 受 --log-bodies 控制——目的是摸清客户端的控制语义。
     """
     _check_auth(authorization, x_api_key, api_key)
+    body = await request.body()
+    if body:
+        text = body.decode("utf-8", "replace")
+        _log(f"[control] 收到控制载荷 | {_truncate(text, 160)}")
+        _log_body(f"[control] ── BODY ──\n{text}")
+    else:
+        _log("[control] 收到控制请求（无 body）")
     return {"ok": True}
 
 
@@ -2566,10 +2578,10 @@ def main():
     ap.add_argument(
         "--stream-read-timeout",
         type=float,
-        default=float(os.environ.get("CODEBUDDY2OPENAI_STREAM_READ_TIMEOUT", 600)),
+        default=float(os.environ.get("CODEBUDDY2OPENAI_STREAM_READ_TIMEOUT", 120)),
         metavar="SEC",
-        help="流式上游 read 空闲超时（秒，默认 600）：两次字节之间的最大间隔，"
-        "防代理链路静默断流（TCP 半开）时永久挂住「等待模型响应」；0 = 不限。"
+        help="流式上游 read 空闲超时（秒，默认 120）：两次字节之间的最大间隔，"
+        "防代理链路静默断流（TCP 半开）时永久挂住「等待模型响应」；0 = 不限。深度思考超过该间隔无字节会被误断（报错、客户端重发）。"
         "也可用环境变量 CODEBUDDY2OPENAI_STREAM_READ_TIMEOUT。",
     )
     ap.add_argument(

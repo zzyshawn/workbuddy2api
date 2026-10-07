@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "updated_at": "2026-10-07 10:16:10",
+  "updated_ts": 1791339370,
+  "env": "cn",
+  "app": {
+    "requests_total": 0,
+    "auth_file": "C:\\Users\\zzy\\AppData\\Local\\CodeBuddyExtension\\Data\\Public\\auth\\Tencent-Cloud.coding-copilot.info",
+    "mode": "direct-proxy (native function calling)"
+  },
+  "models": {
+    "source": "upstream",
+    "count": 17,
+    "ids": [
+      "hy4-preview",
+      "hy3",
+      "hy3-x",
+      "space-bunny",
+      "deepseek-v4.1-flash",
+      "glm-5.3",
+      "glm-5.3-flash",
+      "glm-5.2",
+      "glm-5.1",
+      "glm-5v-turbo",
+      "minimax-m3",
+      "minimax-m2.7",
+      "kimi-k3-1",
+      "kimi-k2.8-preview",
+      "kimi-k2.7",
+      "kimi-k2.6",
+      "deepseek-v4-pro"
+    ],
+    "fetched_at": "2026-10-07 10:16:10",
+    "error": null
+  },
+  "credential": {
+    "uid": "0f6d6ce4-35f4-4d64-ba62-e7d2fcd17950",
+    "nickname": "An Shawn Zhang",
+    "enterpriseName": null,
+    "token_expires_at": 1793854631821,
+    "token_expired": false
+  },
+  "points": null
+}
