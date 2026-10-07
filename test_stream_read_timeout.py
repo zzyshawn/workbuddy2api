@@ -31,12 +31,12 @@ import converter  # noqa: E402
 
 
 def test_idle_timeout_default():
-    """流式（read=None）→ 空闲超时默认 120s（用户拍板：宁快速失败不挂死）。"""
+    """流式（read=None）→ 空闲超时默认 30s（日志统计：响应头 <400ms、生成常态 3-9s）。"""
     saved = converter.CONFIG.get("stream_read_timeout")
-    converter.CONFIG["stream_read_timeout"] = 120.0
+    converter.CONFIG["stream_read_timeout"] = 30.0
     try:
         t = converter._upstream_timeout(None)
-        assert t.read == 120.0, f"read 应为 120，实际 {t.read}"
+        assert t.read == 30.0, f"read 应为 30，实际 {t.read}"
         assert t.connect == 15.0, "connect 超时不应被改动"
     finally:
         if saved is None:
