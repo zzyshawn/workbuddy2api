@@ -811,6 +811,10 @@ CONFIG: dict = {
     "stream_retry": 5,
     #: 重试间隔基数（秒），指数退避：2/4/8/16/30（封顶 30s）。0 = 不等待立即重试。
     "stream_retry_gap": 2.0,
+    #: 流式上游 read 空闲超时（秒）：两次字节之间的最大间隔。SOCKS5 隧道静默
+    #: 死亡（TCP 半开）时 read 会永远阻塞，客户端停在「等待模型响应」；
+    #: 600s 内一个字节都没有基本可断定链路死了。0 = 不限（恢复旧行为）。
+    "stream_read_timeout": 600.0,
 }
 # cred: CredentialManager | None；registry: ModelRegistry | None
 # checkin: CheckinScheduler | None（签到执行体，供 /admin/checkin 沿用旧结构）
@@ -868,9 +872,18 @@ def _upstream_timeout(read) -> httpx.Timeout:
     为什么：2026-09-26 排查「新会话第一遍没反应、要问两遍」发现，流式路径
     `timeout=None` 意味着**连接阶段也没有超时** —— TLS 握手经代理挂死时，
     服务端无限傻等，而客户端有自己的首字节超时，等不到任何字节就放弃重发，
-    表现就是「第一遍只是联通了一下」。connect 限时快速失败后交给重试循环；
-    read 不能限（SSE 长流，思考模型出首字节前后间隔可达数分钟）。
+    表现就是「第一遍只是联通了一下」。connect 限时快速失败后交给重试循环。
+
+    read 超时的语义是 httpx 的 socket 级 read —— **两次字节之间的最大间隔**
+    （不是总时长），所以流式路径给一个较大的空闲超时（默认 600s）而不是 None：
+    2026-10-07 排查「国际版经常卡在等待模型响应（31m14s）」发现，SOCKS5 隧道
+    静默死亡（TCP 半开）时 read 永远阻塞，客户端就一直转圈。深度思考模型
+    正常也会持续吐 reasoning delta，10 分钟一个字节都没有基本可断定链路死了，
+    主动断开报错好过永远挂住。传 None 仍表示不限（显式禁用）。
     """
+    if read is None:
+        v = CONFIG.get("stream_read_timeout")
+        read = None if v == 0 else float(v or 600)
     return httpx.Timeout(connect=15.0, read=read, write=30.0, pool=15.0)
 
 
@@ -1245,6 +1258,25 @@ def admin_tasks_run(
             },
         )
     return tasks.run_task(which, reason="manual").as_dict()
+
+
+@app.post("/chat/completions/control")
+@app.post("/v1/chat/completions/control")
+async def chat_completions_control(
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-Api-Key"),
+    api_key: str | None = Header(default=None, alias="api-key"),
+):
+    """流式控制通道占位端点（2026-10-07）。
+
+    某些 node 客户端（ua=node）在流式对话期间会向
+    `/v1/chat/completions/control` 发控制请求（中断/心跳类）。此前 404，
+    客户端可能因拿不到应答而停在「等待模型响应」。这里最小实现：鉴权后
+    返回 200 空对象，不携带任何状态——真实控制语义（如中断生成）等观察
+    到客户端的具体载荷再补。鉴权失败照常 401，与主对话端点一致。
+    """
+    _check_auth(authorization, x_api_key, api_key)
+    return {"ok": True}
 
 
 @app.post("/chat/completions")
@@ -2532,6 +2564,15 @@ def main():
         "也可用环境变量 CODEBUDDY2OPENAI_STREAM_RETRY_GAP。",
     )
     ap.add_argument(
+        "--stream-read-timeout",
+        type=float,
+        default=float(os.environ.get("CODEBUDDY2OPENAI_STREAM_READ_TIMEOUT", 600)),
+        metavar="SEC",
+        help="流式上游 read 空闲超时（秒，默认 600）：两次字节之间的最大间隔，"
+        "防代理链路静默断流（TCP 半开）时永久挂住「等待模型响应」；0 = 不限。"
+        "也可用环境变量 CODEBUDDY2OPENAI_STREAM_READ_TIMEOUT。",
+    )
+    ap.add_argument(
         "--ua-version",
         default=os.environ.get("CODEBUDDY2OPENAI_UA_VERSION") or None,
         metavar="VER",
@@ -2763,6 +2804,7 @@ def main():
     CONFIG["log_bodies"] = bool(args.log_bodies)
     CONFIG["stream_retry"] = max(0, int(args.stream_retry))
     CONFIG["stream_retry_gap"] = max(0.0, float(args.stream_retry_gap))
+    CONFIG["stream_read_timeout"] = max(0.0, float(args.stream_read_timeout))
     af = find_auth_file(env_name)
     # 同目录多凭据 → 认领结果可能不是你想要的，明确警告而不是静默取值。
     _siblings = find_all_auth_files(env_name)
