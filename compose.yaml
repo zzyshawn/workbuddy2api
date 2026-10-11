@@ -76,7 +76,7 @@ services:
     # 镜像 tag = model_registry.SERVICE_VERSION（CLI 版本 + 服务构建号）。
     # ⚠️ 服务代码每次实质变更必须 bump model_registry.SERVICE_BUILD 并同步改这行
     # —— tag 不变会静默复用旧镜像（踩过两次）。
-    image: workbuddy2api:2.158.0-b13
+    image: workbuddy2api:2.158.0-b14
     container_name: workbuddy2api-intl
 
     ports:
@@ -97,6 +97,19 @@ services:
       # ---- 环境锁定 intl：双实例下各自认准自己的凭据，不靠 auto 推断 ----
       - CODEBUDDY2OPENAI_ENV=intl
       - CODEBUDDY2OPENAI_AUTH_INTL=/data/auth/intl/Tencent-Cloud.coding-copilot.info
+
+      # ---- 多账号池（accounts.json，热加载）----
+      # 默认在 auth 目录旁按环境查找 /data/accounts-intl.json（不存在则回落
+      # /data/accounts.json；都不存在则优雅降级为单账号模式）。
+      # 双实例共用 /data/auth 卷，文件名必须按环境区分 —— intl 容器只认
+      # accounts-intl.json，cn 容器只认 accounts-cn.json，互不串号。
+      # 文件格式示例（proxy 缺省=走下面代理链，""=强制直连）：
+      #   {"default_uid": "<uid>",
+      #    "accounts": [{"uid": "<uid>", "auth": "auth/intl/a.info",
+      #                  "proxy": "socks5://user:pass@host:port",
+      #                  "priority": 1, "enabled": true}]}
+      # 显式覆盖路径时用：
+      # - CODEBUDDY2OPENAI_ACCOUNTS_FILE=/data/accounts-intl.json
 
       # ---- 国际域代理（东京 VPS SOCKS5）----
       # 签到/对话都是 HTTPS over TCP，代理只需支持 TCP 转发；
@@ -119,7 +132,9 @@ services:
       - CODEBUDDY2OPENAI_STREAM_RETRY=10
 
       # ---- 上游 UA 版本（可选）----
-      # ① 版本文件（推荐，热生效）：logs/ua-version.txt，清空 = 恢复内置默认。
+      # ① 版本文件（推荐，热生效）：logs/ua-version-intl.txt（本实例），
+      #    cn 实例用 logs/ua-version-cn.txt；都不存在时回落 logs/ua-version.txt。
+      #    清空 = 恢复内置默认。
       # ② 环境变量（要重建容器才生效）：
       # - CODEBUDDY2OPENAI_UA_VERSION=2.158.0
 
@@ -180,7 +195,7 @@ services:
   # 正常可自持；若再度 401，重新从桌面端拷一份最新明文文件即可。
   # ===========================================================================
   workbuddy2api-cn:
-    image: workbuddy2api:2.158.0-b13
+    image: workbuddy2api:2.158.0-b14
     container_name: workbuddy2api-cn
 
     ports:
@@ -195,6 +210,8 @@ services:
       - CODEBUDDY_AUTH_DIR=/data/auth
       - CODEBUDDY2OPENAI_ENV=cn
       - CODEBUDDY2OPENAI_AUTH_CN=/data/auth/cn/Tencent-Cloud.coding-copilot.info
+      # 多账号池：默认找 /data/accounts-cn.json（回落 /data/accounts.json），
+      # 不存在则单账号模式。显式覆盖：CODEBUDDY2OPENAI_ACCOUNTS_FILE。
       # 国内域家里直连即可，不配代理；要配时用：
       # - CODEBUDDY2OPENAI_PROXY_CN=
 

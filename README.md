@@ -53,6 +53,44 @@
 | 每日自动签到 | 后台调度 + `/admin/checkin` | 已支持，默认每天 `09:00` / `21:00` |
 | 模型缓存状态 | `/admin/models` | 已支持 |
 | Health Check | `/health` | 已支持 |
+| 多账号池 | `accounts-*.json` | 已支持，见[多账号池](#多账号池) |
+
+---
+
+## 多账号池
+
+把多个 WorkBuddy 登录态放进一个 `accounts.json`，同一个请求内撞到账号级故障
+会自动换下一个号继续。不配这个文件时，行为和以前一样（单账号）。
+
+### 配置
+
+在 auth 目录旁放一个 `accounts-<env>.json`（国际版 `accounts-intl.json`、
+国内版 `accounts-cn.json`；都不存在时回落 `accounts.json`），脱敏示例见
+[`accounts.example.json`](accounts.example.json)。修改后按修改时间自动重载，
+不用重启。
+
+- `uid` 可省略，省略时从 auth 文件里读；`default_uid` 的账号优先被选中，
+  其余按 `priority` 从小到大。
+- `proxy`：缺省走默认代理链；`""` 强制直连；写 URL 则这个账号走独立代理
+  （签到和对话都用）。
+- `enabled: false` 的账号直接跳过。
+
+也可以用 `--accounts-file` / `CODEBUDDY2OPENAI_ACCOUNTS_FILE` 显式指定路径。
+
+### 故障怎么换号
+
+- `request illegal`（账号被封禁）：永久禁用该号，首选自动改指下一个可用账号，
+  状态落盘到 `state-*.json`，重启不丢失。被禁用的号只能靠**重新 OAuth 登录**
+  恢复 —— 签到任务每次跑之前会自动探测并解禁已重新登录的账号。
+- session 失效（`12153` / `Offline user session not found`）：同样禁用，
+  同样靠重新登录恢复。
+- 上游报 `The model provider is rate-limiting requests.` 只是模型级限流，
+  **不会**禁号（即使 code 也是 11140，也只按软限流处理）。
+- 全池都不可用时请求直接返回失败（503），不无限重试；
+  流式响应已经开始推首字节后不再换号，避免内容重复。
+
+`/health` 里能看到每账号的状态和禁用原因，`accounts.json` 的代理密码绝不
+进日志和状态文件。
 
 ---
 

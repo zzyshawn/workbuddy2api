@@ -36,8 +36,13 @@ auths/
 *.key
 secrets.*
 
-# 真实配置不进仓库（仓库只留 config.example.json）
+# 真实配置不进仓库（仓库只留 config.example.json / accounts.example.json）
 config.json
+# 真实账号池配置（每账号 auth 路径 + 可能含代理密码，绝不入库；仓库只留脱敏示例）
+accounts.json
+accounts-*.json
+# 例外：脱敏示例必须入库
+!accounts.example.json
 
 # IDE / 助手工作区
 .idea/

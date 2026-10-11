@@ -11,7 +11,7 @@ COPY converter.py responses_adapter.py responses_projection.py \
      anthropic_adapter.py desensitize.py model_registry.py checkin.py \
      task_result.py growth_api.py task_scheduler.py environments.py \
      reasoning.py model_capabilities.py \
-     state_snapshot.py \
+     state_snapshot.py account_pool.py \
      activity.py travel.py keepalive.py school.py blackcat.py ./
 
 # 动态模型快照 + 签到留档 + 六类任务留档的落盘目录（容器内可写；想跨重启保留就挂个卷）

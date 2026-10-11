@@ -102,6 +102,32 @@ def set_cli_version_file(path: str | None) -> None:
     _ua_file_cache = {"mtime": None, "value": None}
 
 
+def default_version_file(
+    log_path: str | os.PathLike | None, env: str | None = None
+) -> str | None:
+    """默认版本文件路径：与日志同目录的 `ua-version-<env>.txt`。
+
+    为什么按环境派生：双实例（intl/cn）共用 /logs 卷，旧的 `ua-version.txt`
+    会被两个实例抢 —— 一边改版本号另一边跟着变。派生名不存在时回落读旧的
+    `ua-version.txt`（向后兼容，老部署不崩）。
+    注意：只改 UA 版本文件，不改镜像 tag 规则（那是 SERVICE_VERSION 的事）。
+    """
+    if not log_path:
+        return None
+    p = Path(log_path)
+    e = (env or "").strip()
+    if e:
+        per_env = p.with_name(f"ua-version-{e}.txt")
+        if per_env.exists():
+            return str(per_env)
+    legacy = p.with_name("ua-version.txt")
+    if legacy.exists():
+        return str(legacy)
+    # 都不存在也返回派生名（读文件处已能优雅处理缺失；调用方据此打印提示，
+    # 告诉用户文件该放哪里）。
+    return str(p.with_name(f"ua-version-{e}.txt") if e else legacy)
+
+
 def _read_version_file() -> str | None:
     """读版本文件，带 mtime 缓存（与凭据文件的 _load_if_stale 同一策略）。
 
@@ -153,7 +179,7 @@ def effective_cli_version() -> str:
 #: 为什么要拆开：image tag 若一直等于 2.155.0，`docker compose up -d` 会复用
 #: 旧镜像，改了代码不生效（踩过两次）；而 --no-cache 靠人记，迟早忘。
 #: tag 变了 Docker 自然新建镜像 —— 这才是版本号的本来目的。
-SERVICE_BUILD = 13
+SERVICE_BUILD = 14
 
 #: 对外版本串（包名 / 镜像 tag / 启动日志统一用这个）：
 #: `2.155.0-b2` = CLI 版本 + 服务构建号。单一真源仍是本文件，别处不得硬编码。

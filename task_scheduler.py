@@ -35,6 +35,8 @@ from typing import Callable
 from checkin import CheckinScheduler, DEFAULT_CHECKIN_HOURS, normalize_hours
 from task_result import TaskOutcome, outcome_from_entry
 
+from account_pool import short_uid
+
 import activity
 import blackcat
 import keepalive
@@ -130,6 +132,7 @@ class TaskScheduler(threading.Thread):
         run_on_start: tuple[str, ...] | list[str] = (),
         transport: object | None = None,
         runners: dict | None = None,
+        pool=None,
         log: Callable[[str], None] | None = None,
         on_result: Callable[[str, dict], None] | None = None,
     ):
@@ -140,6 +143,9 @@ class TaskScheduler(threading.Thread):
         self.catchup_window = float(catchup_window)
         self.run_on_start = tuple(run_on_start or ())
         self.transport = transport
+        #: 账号池（R4）：六类任务按池中账号循环，每个账号用自己的代理。
+        #: runners 显式注入时（测试替身）pool 不生效 —— 替身优先。
+        self.pool = pool
         self._log = log or (lambda _m: None)
         #: 每跑完一类任务回调一次（key, 结果字典）。装配处用它来刷新状态快照。
         #: 做成回调而不是让调度器直接依赖快照模块 —— 保持「任务模块不 import 观测模块」
@@ -156,6 +162,10 @@ class TaskScheduler(threading.Thread):
 
         #: runners 显式注入时原样采用（测试替身 / 自定义装配），否则按配置构建。
         self.runners = runners if runners is not None else self._build_runners()
+        #: 多账号模式：每个账号一套 runners（延迟构建，见 _runners_for_account）。
+        #: self.runners 保持为"首选账号"那一套 —— /admin/* 与旧调用点走它。
+        self._multi = pool is not None and runners is None and pool.has_accounts()
+        self.account_runners: dict[str, dict] = {}
         #: 签到执行体单独留一个引用：/admin/checkin 需要它（且要保持旧状态结构）。
         self.checkin_runner: CheckinScheduler | None = self.runners.get("checkin")  # type: ignore[assignment]
 
@@ -168,7 +178,7 @@ class TaskScheduler(threading.Thread):
     # ------------------------------------------------------------------ 构建
 
     def _build_runners(self) -> dict:
-        """按配置构建六类执行体。
+        """按配置构建六类执行体（首选账号 / 单账号的那一套）。
 
         activity 需要「补满对话量后重试领养」，这个动作属于 travel（旅行状态机），
         但 activity 不该 import travel——所以在装配处注入回调（依赖方向单向）。
@@ -176,15 +186,34 @@ class TaskScheduler(threading.Thread):
         env / proxy 同样在**装配处**统一注入：六类任务各自独立成模块、互不 import，
         让它们各自去读环境变量会让「换环境」散落六处；集中在这里注入只改一个地方。
         """
-        env, proxy = self.cfg.env, self.cfg.proxy
+        if self.pool is not None:
+            acct = self.pool.default_account()
+            if acct is not None:
+                return self._build_runners_for(
+                    acct.cred, self.cfg.env, acct.proxy,
+                    self._account_cache_dir(acct.uid),
+                )
+        return self._build_runners_for(
+            self.cred, self.cfg.env, self.cfg.proxy, self.cache_dir
+        )
+
+    def _build_runners_for(
+        self, cred, env: str | None, proxy: str | None, cache_dir: Path | str | None
+    ) -> dict:
+        """为**指定**凭据/代理/缓存目录构建六类执行体。
+
+        多账号模式下每个账号调一次（各自的 cred + proxy + 隔离的缓存子目录）；
+        单账号模式调一次（走旧参数）。任务模块本身不改 —— 它们只管接收
+        cred/env/proxy，不知道账号池的存在（R4 的分层要求）。
+        """
         runners: dict = {}
-        if self.enabled["checkin"] and self.cred is not None:
+        if self.enabled["checkin"] and cred is not None:
             runners["checkin"] = CheckinScheduler(
-                self.cred,
+                cred,
                 hours=self.hours["checkin"],
                 enabled=True,
                 timeout=self.cfg.timeout,
-                cache_dir=self.cache_dir,
+                cache_dir=cache_dir,
                 log=self._log,
                 env=env,
                 proxy=proxy,
@@ -193,7 +222,7 @@ class TaskScheduler(threading.Thread):
         travel_runner = None
         if self.enabled["travel"]:
             travel_runner = travel.TravelRunner(
-                self.cred,
+                cred,
                 location_id=self.cfg.travel_location_id,
                 timeout=self.cfg.timeout,
                 transport=self.transport,
@@ -205,7 +234,7 @@ class TaskScheduler(threading.Thread):
 
         if self.enabled["activity"]:
             runners["activity"] = activity.ActivityRunner(
-                self.cred,
+                cred,
                 count=self.cfg.activity_report_count,
                 report_gap=self.cfg.activity_report_gap,
                 timeout=self.cfg.timeout,
@@ -218,12 +247,12 @@ class TaskScheduler(threading.Thread):
 
         if self.enabled["keepalive"]:
             runners["keepalive"] = keepalive.KeepaliveRunner(
-                self.cred, log=self._log, env=env, proxy=proxy
+                cred, log=self._log, env=env, proxy=proxy
             )
 
         if self.enabled["school"]:
             runners["school"] = school.SchoolRunner(
-                self.cred,
+                cred,
                 gap=self.cfg.school_gap,
                 timeout=self.cfg.timeout,
                 transport=self.transport,
@@ -234,7 +263,7 @@ class TaskScheduler(threading.Thread):
 
         if self.enabled["cat"]:
             runners["cat"] = blackcat.BlackCatRunner(
-                self.cred,
+                cred,
                 timeout=self.cfg.timeout,
                 transport=self.transport,
                 log=self._log,
@@ -242,6 +271,30 @@ class TaskScheduler(threading.Thread):
                 proxy=proxy,
             )
         return runners
+
+    def _account_cache_dir(self, uid: str) -> Path | None:
+        """某账号的隔离缓存目录（checkin-log.json 等留档文件按目录一份，
+        多账号共用会互相覆盖，所以按账号分子目录）。"""
+        if self.cache_dir is None:
+            return None
+        safe = "".join(c if (c.isalnum() or c in "-_") else "_" for c in str(uid))[:32]
+        return self.cache_dir / "accounts" / (safe or "default")
+
+    def _runners_for_account(self, uid: str):
+        """取某账号的 runners（延迟构建并缓存；配置热加载新增的账号也能拿到）。"""
+        with self._lock:
+            rs = self.account_runners.get(uid)
+        if rs is not None:
+            return rs
+        acct = self.pool.get(uid) if self.pool is not None else None
+        if acct is None:
+            return {}
+        rs = self._build_runners_for(
+            acct.cred, self.cfg.env, acct.proxy, self._account_cache_dir(uid)
+        )
+        with self._lock:
+            self.account_runners[uid] = rs
+        return rs
 
     # ------------------------------------------------------------ 持久化
 
@@ -291,7 +344,9 @@ class TaskScheduler(threading.Thread):
         keys = [k for k in TASK_KEYS if k in self.runners]
         return self._fire(keys, reason)
 
-    def _run_kind(self, key: str, reason: str, runner=None) -> TaskOutcome:
+    def _run_kind(self, key: str, reason: str = "manual", runner=None) -> TaskOutcome:
+        if self._multi and runner is None:
+            return self._run_kind_multi(key, reason)
         runner = runner or self.runners[key]
         started = time.time()
         try:
@@ -300,6 +355,76 @@ class TaskScheduler(threading.Thread):
             oc = TaskOutcome(key, False, f"{TASK_LABELS[key]}执行异常：{e}")
         else:
             oc = outcome_from_entry(key, raw)
+        return self._record_outcome(key, reason, oc, started)
+
+    def _run_kind_multi(self, key: str, reason: str) -> TaskOutcome:
+        """多账号模式：每类任务遍历池中所有可用账号（R4）。
+
+        每个账号用自己的 CredentialManager + proxy（装配处注入，任务模块不改）。
+        单账号失败 → 记日志 + continue，不阻断其他账号。
+        签到在跑之前先探测"被禁用的账号是否重新登录过"并自动解禁
+        （对应上游"签到负责解冻"的设计意图 —— 永久禁用的号只能靠重新登录恢复）。
+        """
+        pool = self.pool
+        started = time.time()
+        if key == "checkin":
+            recovered = pool.poll_relogins()
+            if recovered:
+                self._log(
+                    f"[tasks] 签到：{len(recovered)} 个账号重新登录已恢复："
+                    + "、".join(short_uid(u) for u in recovered)
+                )
+        accounts = pool.task_accounts()
+        if not accounts:
+            oc = TaskOutcome(key, False, f"{TASK_LABELS[key]}跳过：池中无可用账号")
+            return self._record_outcome(key, reason, oc, started)
+        per: list[dict] = []
+        ok_count = 0
+        for acct in accounts:
+            runners = self._runners_for_account(acct.uid)
+            runner = runners.get(key)
+            if runner is None:
+                per.append({"uid": acct.uid, "ok": False, "summary": "执行体未构建"})
+                self._log(
+                    f"[tasks] {TASK_LABELS[key]} 账号 {short_uid(acct.uid)}：执行体未构建，跳过"
+                )
+                continue
+            t0 = time.time()
+            try:
+                raw = runner.run_once(reason=reason)
+            except Exception as e:  # noqa: BLE001 — 单账号异常不带崩整批
+                oc1 = TaskOutcome(key, False, f"{TASK_LABELS[key]}执行异常：{e}")
+            else:
+                oc1 = outcome_from_entry(key, raw)
+            oc1.detail = {
+                **oc1.detail,
+                "uid": acct.uid,
+                "elapsed_ms": int((time.time() - t0) * 1000),
+            }
+            per.append({"uid": acct.uid, "ok": oc1.ok, "summary": oc1.summary})
+            if oc1.ok:
+                ok_count += 1
+            else:
+                # 默认档就要能看到：哪个账号的哪类任务挂了。
+                self._log(
+                    f"[tasks] {TASK_LABELS[key]} 账号 {short_uid(acct.uid)} 未成功：{oc1.summary}"
+                )
+        total = len(per)
+        ok = ok_count == total
+        summary = f"{TASK_LABELS[key]}：{ok_count}/{total} 账号成功"
+        fails = [p for p in per if not p["ok"]]
+        if fails:
+            summary += "；失败：" + "、".join(
+                f"{short_uid(p['uid'])}({p['summary'][:40]})" for p in fails
+            )
+        oc = TaskOutcome(key, ok, summary)
+        oc.detail = {"accounts": per}
+        return self._record_outcome(key, reason, oc, started)
+
+    def _record_outcome(
+        self, key: str, reason: str, oc: TaskOutcome, started: float
+    ) -> TaskOutcome:
+        """收尾：补元信息 → 记 last/history → 结果回调。单/多账号共用。"""
         entry = {"reason": reason, "elapsed_ms": int((time.time() - started) * 1000)}
         oc.detail = {**oc.detail, **entry}
         with self._lock:

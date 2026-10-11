@@ -31,6 +31,9 @@ scripts/
 /signin_bin
 # 真实配置不进镜像（镜像默认用 config.example.json，生产以挂载卷覆盖）
 config.json
+# 真实账号池配置不进镜像（仓库只留 accounts.example.json，生产以挂载卷覆盖）
+accounts.json
+accounts-*.json
 PLAN.md
 SPEC.md
 LOOP.md

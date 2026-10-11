@@ -56,6 +56,7 @@ from anthropic_adapter import (
     anthropic_request_to_chat,
 )
 from checkin import billing_ua
+import account_pool
 import environments
 import model_registry
 from model_registry import (
@@ -521,13 +522,21 @@ def _load_models_from_workbuddy() -> list[str]:
 
 
 def _safe_cred_headers(within_ms: int = 60_000) -> dict | None:
-    """取一份带最新 token 的请求头；取不到返回 None（调用方自行回退）。"""
+    """取一份带最新 token 的请求头；取不到返回 None（调用方自行回退）。
+
+    多账号模式下代理来自池当前首选账号（CONFIG["cred"] 已由 _sync_default_cred
+    跟随首选，代理同理取自账号 —— intl/cn 实例的代理本来就在实例级，账号级
+    代理是个别账号的覆盖）。
+    """
     cred = CONFIG.get("cred")
     if cred is None:
         return None
+    pool = CONFIG.get("pool")
+    acct = pool.default_account() if pool is not None else None
+    proxy = acct.proxy if acct is not None else CONFIG.get("proxy")
     try:
         return cred.get_headers(
-            within_ms=within_ms, env=CONFIG.get("env"), proxy=CONFIG.get("proxy")
+            within_ms=within_ms, env=CONFIG.get("env"), proxy=proxy
         )
     except Exception as e:  # noqa: BLE001
         _log(f"[models] WARN 取凭据失败，走回退：{e}")
@@ -658,6 +667,13 @@ def _collect_state() -> dict:
             cred_summary = {"error": str(e)}
     checkin = CONFIG.get("checkin")
     tasks = CONFIG.get("tasks")
+    pool = CONFIG.get("pool")
+    pool_status = None
+    if pool is not None:
+        try:
+            pool_status = pool.status()
+        except Exception:  # noqa: BLE001 — 观测采集不能影响快照
+            pool_status = {"error": "pool status failed"}
     return state_snapshot.build_snapshot(
         env=CONFIG.get("env"),
         app={
@@ -669,6 +685,7 @@ def _collect_state() -> dict:
         credential=cred_summary,
         checkin=checkin.status() if checkin is not None else None,
         tasks=tasks.status() if tasks is not None else None,
+        account_pool=pool_status,
     )
 
 
@@ -1024,8 +1041,10 @@ def _check_auth(
         )
 
 
-def _cred() -> CredentialManager:
-    if CONFIG["cred"] is None:
+def _pool() -> "account_pool.AccountPool":
+    """取账号池；池为空（无任何账号）时 503（无凭据）。"""
+    pool = CONFIG.get("pool")
+    if pool is None or not pool.has_accounts():
         raise HTTPException(
             status_code=503,
             detail={
@@ -1035,7 +1054,63 @@ def _cred() -> CredentialManager:
                 }
             },
         )
-    return CONFIG["cred"]
+    return pool
+
+
+async def _with_account_rotation(pool, *, rid: str, model_name: str, attempt):
+    """同一请求内按池顺序尝试账号（R3）。
+
+    `attempt(acct)` 是协程：用该账号做一次上游调用并返回结果；
+    撞上账号级故障时抛 `account_pool.AccountFaultError`。
+    账号被禁用后换下一个继续；全部轮训完仍失败 → 直接抛 503，
+    不再重试、不再换号（用户明确要求「全轮训完就失败」）。
+
+    注意：只用于**缓冲式**路径（非流式聚合）。流式路径的换号必须在
+    「首字节发出前」完成，逻辑内嵌在各流式生成器里（见 _stream_upstream），
+    不能复用这里 —— 流一旦开始转发就绝不能换号（避免内容重复）。
+    """
+    last_fault: account_pool.AccountFaultError | None = None
+    tried: list[str] = []
+    for acct in pool.ordered_available():
+        tried.append(acct.uid)
+        pool.note_attempt(acct.uid)
+        try:
+            return await attempt(acct)
+        except account_pool.AccountFaultError as e:
+            last_fault = e
+            pool.mark_account_fault(e.uid, e.reason, http_status=e.http_status)
+            _log(
+                f"[{rid}] ⇄ 账号 {account_pool.short_uid(e.uid)} 上游故障"
+                f"（{e.reason}），同一请求内换下一个账号"
+            )
+            continue
+    _log(
+        f"[{rid}] ✗ 账号池已耗尽"
+        f"（已试：{','.join(account_pool.short_uid(u) for u in tried) or '无可用账号'}），"
+        f"请求直接失败"
+    )
+    detail_msg = (
+        f"all accounts unavailable"
+        + (f": {last_fault.reason}" if last_fault else "（池中无可用账号）")
+    )
+    raise HTTPException(
+        status_code=503,
+        detail={"error": {"message": detail_msg, "type": "account_pool_exhausted"}},
+    )
+
+
+def _account_headers(acct, *, rid: str = "") -> dict | None:
+    """取某账号的上游请求头；取失败（刷新失败等）返回 None（调用方换号）。
+
+    为什么取失败也换号：refresh 失败基本意味着这个 session 已经死了，
+    硬闯只会再撞 401；有别的账号就该换过去，而不是直接 500。
+    """
+    try:
+        return acct.cred.get_headers()
+    except Exception as e:  # noqa: BLE001 — 刷新失败等
+        prefix = f"[{rid}] " if rid else ""
+        _log(f"{prefix}⚠️ 账号 {account_pool.short_uid(acct.uid)} 取凭据失败：{_truncate(str(e), 120)}，换下一个账号")
+        return None
 
 
 @app.get("/health")
@@ -1056,6 +1131,11 @@ def health():
             info["credential"] = cred.summary()
         except Exception as e:
             info["credential_error"] = str(e)
+    pool = CONFIG.get("pool")
+    if pool is not None:
+        # 账号池摘要：可用数 / 总数 / 当前首选 + 每账号状态（含 disabled_reason）。
+        # 代理 URL 含密码，pool.status() 里已确保不出现。
+        info["account_pool"] = pool.status()
     reg = CONFIG.get("registry")
     if reg is not None:
         st = reg.status()
@@ -1300,7 +1380,7 @@ async def chat_completions(
     api_key: str | None = Header(default=None, alias="api-key"),
 ):
     _check_auth(authorization, x_api_key, api_key)
-    cred = _cred()
+    pool = _pool()
 
     try:
         payload = await request.json()
@@ -1391,55 +1471,25 @@ async def chat_completions(
         f"[{rid}] ── REQUEST BODY (发往后端) ──\n{json.dumps(body, ensure_ascii=False, indent=2)}"
     )
 
-    headers = cred.get_headers()
     url = f"{BACKEND}/v2/chat/completions"
     t0 = time.time()
 
     if client_wants_stream:
         return StreamingResponse(
-            _stream_upstream(url, headers, body, model_name, t0, rid),
+            _stream_upstream(url, pool, body, model_name, t0, rid),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     # 非流式：后端只支持流式，这里把后端 SSE 聚合成单个 chat.completion 响应。
     # 响应聚合完才返回给客户端 —— 任何时刻的网络错误都可以安全重试。
-    collected = None
-    retries = max(0, int(CONFIG.get("stream_retry", 1)))
-    for attempt in range(1, retries + 2):
-        try:
-            async with environments.make_async_client(CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=_upstream_timeout(300)) as c:
-                async with c.stream("POST", url, headers=headers, json=body) as r:
-                    if r.status_code != 200:
-                        raw = await r.aread()
-                        _log(
-                            f"[{rid}] ✗ HTTP {r.status_code} | {model_name} | {_truncate(raw.decode('utf-8', 'replace'), 200)}"
-                        )
-                        _log_body(f"[{rid}] ── ERROR BODY ──\n{raw.decode('utf-8', 'replace')}")
-                        raise HTTPException(
-                            status_code=r.status_code,
-                            detail=_safe_err_raw(raw, r.status_code),
-                        )
-                    collected = await _collect_stream(r)
-            break
-        except HTTPException:
-            raise
-        except httpx.HTTPError as e:
-            if attempt > retries:
-                _log(
-                    f"[{rid}] ✗ 网络错误 | {model_name} | {type(e).__name__}: {e}；重试后仍失败"
-                )
-                raise HTTPException(
-                    status_code=502,
-                    detail={
-                        "error": {"message": f"upstream error: {e}", "type": "upstream_error"}
-                    },
-                ) from None
-            _log(
-                f"[{rid}] ↻ 网络错误 | {model_name} | {type(e).__name__}: {e}"
-                f" | 自动重试 {attempt}/{retries}"
-            )
-            await _retry_wait(attempt)
+    # 账号级故障（R3）走 _with_account_rotation：禁用该账号、同一请求内换下一个。
+    collected = await _with_account_rotation(
+        pool,
+        rid=rid,
+        model_name=model_name,
+        attempt=lambda acct: _chat_nonstream_once(acct, url, body, model_name, rid),
+    )
     _log_finish(model_name, t0, collected, rid)
     return JSONResponse(content=collected)
 
@@ -1656,9 +1706,65 @@ def _safe_err_raw(raw: bytes, status: int) -> dict:
         }
 
 
+async def _chat_nonstream_once(acct, url: str, body: dict, model_name: str, rid: str):
+    """用指定账号做一次非流式上游调用（后端 SSE 缓冲聚合成单个响应）。
+
+    网络错误按原有规则在**同账号内**重试（次数 = CONFIG["stream_retry"]）；
+    上游非 200 时先做账号级故障分类 —— 命中则抛 AccountFaultError
+    （外层 _with_account_rotation 换号），否则保持原有的 HTTPException 透传。
+    """
+    headers = _account_headers(acct, rid=rid)
+    if headers is None:
+        raise account_pool.AccountFaultError(acct.uid, "取凭据/刷新失败")
+    retries = max(0, int(CONFIG.get("stream_retry", 1)))
+    for attempt in range(1, retries + 2):
+        try:
+            async with environments.make_async_client(
+                CONFIG.get("env"), proxy=acct.proxy, timeout=_upstream_timeout(300)
+            ) as c:
+                async with c.stream("POST", url, headers=headers, json=body) as r:
+                    if r.status_code != 200:
+                        raw = await r.aread()
+                        _log(
+                            f"[{rid}] ✗ HTTP {r.status_code} | {model_name} | {_truncate(raw.decode('utf-8', 'replace'), 200)}"
+                        )
+                        _log_body(f"[{rid}] ── ERROR BODY ──\n{raw.decode('utf-8', 'replace')}")
+                        reason = account_pool.classify_account_fault(r.status_code, raw)
+                        if reason is not None:
+                            raise account_pool.AccountFaultError(
+                                acct.uid, reason, r.status_code, raw
+                            )
+                        raise HTTPException(
+                            status_code=r.status_code,
+                            detail=_safe_err_raw(raw, r.status_code),
+                        )
+                    return await _collect_stream(r)
+        except HTTPException:
+            raise
+        except account_pool.AccountFaultError:
+            raise
+        except httpx.HTTPError as e:
+            if attempt > retries:
+                _log(
+                    f"[{rid}] ✗ 网络错误 | {model_name} | {type(e).__name__}: {e}；重试后仍失败"
+                )
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "error": {"message": f"upstream error: {e}", "type": "upstream_error"}
+                    },
+                ) from None
+            _log(
+                f"[{rid}] ↻ 网络错误 | {model_name} | {type(e).__name__}: {e}"
+                f" | 自动重试 {attempt}/{retries}"
+            )
+            await _retry_wait(attempt)
+    raise RuntimeError("unreachable")  # pragma: no cover
+
+
 async def _stream_upstream(
     url: str,
-    headers: dict,
+    pool,
     body: dict,
     model_name: str = "?",
     t0: float = 0.0,
@@ -1668,6 +1774,8 @@ async def _stream_upstream(
 
     同时轻量解析流，统计 finish_reason / tool_calls / usage 用于日志，不阻塞转发。
     完整原始 SSE 累积后落盘到日志（调试用）。
+
+    pool：账号池。上游在首字节前回账号级故障时禁用并换号；流开始转发后绝不换号。
     """
     finish_reason = None
     tool_names: list[str] = []
@@ -1730,16 +1838,36 @@ async def _stream_upstream(
     # （建连失败 / SOCKS 隧道抖动 / 上游在出首字节前重置——正是线上见到的那种
     # 「✗ 网络错误」。已开始转发后再断流，客户端已收到部分数据，重试会造成
     # 内容重复，只能报错。上游明确回非 200 也不重试（确定性拒绝）。
+    #
+    # —— 账号级故障换号（R3）：上游在首字节前回非 200 且命中账号级故障关键词时，
+    # 禁用该账号并换下一个（box["rotate"]=True）。换号同样只发生在首字节前，
+    # 与上面的"已转发不再重试"规则天然兼容 —— 流开始转发后绝不换号。
     terminal = False  # True = 非 200 的错误事件已发给客户端，直接结束
 
-    async def _attempt():
+    async def _attempt(acct, box):
         nonlocal terminal
+        headers = _account_headers(acct, rid=rid)
+        if headers is None:
+            pool.mark_account_fault(acct.uid, "取凭据/刷新失败")
+            _log(f"{prefix}⇄ 账号 {account_pool.short_uid(acct.uid)} 取凭据失败，换下一个账号")
+            box["rotate"] = True
+            return
+        pool.note_attempt(acct.uid)
         async with environments.make_async_client(
-            CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=_upstream_timeout(None)
+            CONFIG.get("env"), proxy=acct.proxy, timeout=_upstream_timeout(None)
         ) as c:
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     err = await r.aread()
+                    reason = account_pool.classify_account_fault(r.status_code, err)
+                    if reason is not None:
+                        pool.mark_account_fault(acct.uid, reason, http_status=r.status_code)
+                        _log(
+                            f"{prefix}⇄ 账号 {account_pool.short_uid(acct.uid)} 上游故障"
+                            f"（{reason}），换下一个账号"
+                        )
+                        box["rotate"] = True
+                        return
                     _log(
                         f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8', 'replace'), 200)}"
                     )
@@ -1757,9 +1885,25 @@ async def _stream_upstream(
     for attempt in range(1, retries + 2):
         sent_any = False
         try:
-            async for chunk in _attempt():
-                sent_any = True
-                yield chunk
+            exhausted = True
+            for acct in pool.ordered_available():
+                box = {"rotate": False}
+                async for chunk in _attempt(acct, box):
+                    sent_any = True
+                    yield chunk
+                if not box["rotate"]:
+                    exhausted = False
+                    break
+            if exhausted:
+                # 全部账号都撞上账号级故障（或池为空）→ 直接失败，不再重试换号
+                _log(f"{prefix}✗ 账号池已耗尽，请求直接失败")
+                terminal = True
+                yield _err_event(
+                    b'{"error":{"message":"all accounts unavailable",'
+                    b'"type":"account_pool_exhausted"}}',
+                    503,
+                )
+                return
             break  # 正常走完
         except httpx.HTTPError as e:
             if sent_any or attempt > retries:
@@ -1844,9 +1988,19 @@ def _chat_body_desensitize(body: dict, *, force_compact: bool = False) -> dict:
 
 
 async def _post_backend_once(
-    url: str, headers: dict, body: dict, *, rid: str = "", model_name: str = "?"
+    url: str,
+    headers: dict,
+    body: dict,
+    *,
+    proxy: str | None,
+    rid: str = "",
+    model_name: str = "?",
 ) -> tuple[int, bytes]:
     """单次请求后端并**缓冲完整响应**。
+
+    proxy 必须显式传入（账号池场景下每个账号的代理不同，不能再读全局 CONFIG）。
+    proxy 语义与 environments._proxy_kwargs 一致：None=走 resolve 链，
+    ""=强制直连，URL=原样使用。
 
     网络层失败自动重试（次数 = CONFIG["stream_retry"]）：本函数把响应整个缓冲完
     才返回，调用方还没向客户端发出任何东西，重发是安全的。非 200 不重试
@@ -1856,7 +2010,7 @@ async def _post_backend_once(
     retries = max(0, int(CONFIG.get("stream_retry", 1)))
     for attempt in range(1, retries + 2):
         try:
-            async with environments.make_async_client(CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=_upstream_timeout(120)) as c:
+            async with environments.make_async_client(CONFIG.get("env"), proxy=proxy, timeout=_upstream_timeout(120)) as c:
                 async with c.stream("POST", url, headers=headers, json=body) as r:
                     chunks: list[bytes] = []
                     async for chunk in r.aiter_bytes():
@@ -1875,31 +2029,72 @@ async def _post_backend_once(
 
 
 async def _post_backend_with_filter_retry(
-    url: str, headers: dict, body: dict, rid: str = "", model_name: str = "?"
+    url: str, pool, body: dict, rid: str = "", model_name: str = "?"
 ) -> tuple[int, bytes, dict]:
+    """缓冲式调后端（含内容审核拦截时的脱敏重试），带账号池换号（R3）。
+
+    同一请求内按池顺序尝试账号：账号级故障 → 禁用并换下一个；
+    全池耗尽 → 抛 HTTPException(503)。非账号故障的非 200 保持原有透传。
+    """
     prefix = f"[{rid}] " if rid else ""
-    status, raw = await _post_backend_once(url, headers, body, rid=rid, model_name=model_name)
-    text = raw.decode("utf-8", "replace")
-    if (
-        status == 200
-        and _looks_like_content_filter_text(text)
-        and CONFIG.get("desensitize")
-        and CONFIG.get("no_compact")
-    ):
-        retry_body = _chat_body_desensitize(body, force_compact=True)
-        _log(
-            f"{prefix}↻ RESPONSES {model_name} | content filter detected, retry with compact harness"
+    last_fault: account_pool.AccountFaultError | None = None
+    tried: list[str] = []
+    for acct in pool.ordered_available():
+        tried.append(acct.uid)
+        pool.note_attempt(acct.uid)
+        headers = _account_headers(acct, rid=rid)
+        if headers is None:
+            pool.mark_account_fault(acct.uid, "取凭据/刷新失败")
+            _log(f"{prefix}⇄ 账号 {account_pool.short_uid(acct.uid)} 取凭据失败，换下一个账号")
+            continue
+        status, raw = await _post_backend_once(
+            url, headers, body, proxy=acct.proxy, rid=rid, model_name=model_name
         )
-        _log_body(
-            f"{prefix}── RESPONSES RETRY CHAT BODY ──\n{json.dumps(retry_body, ensure_ascii=False, indent=2)}"
-        )
-        retry_status, retry_raw = await _post_backend_once(
-            url, headers, retry_body, rid=rid, model_name=model_name
-        )
-        retry_text = retry_raw.decode("utf-8", "replace")
-        if retry_status == 200 and not _looks_like_content_filter_text(retry_text):
-            return retry_status, retry_raw, retry_body
-    return status, raw, body
+        reason = account_pool.classify_account_fault(status, raw)
+        if reason is not None:
+            last_fault = account_pool.AccountFaultError(acct.uid, reason, status, raw)
+            pool.mark_account_fault(acct.uid, reason, http_status=status)
+            _log(
+                f"{prefix}⇄ 账号 {account_pool.short_uid(acct.uid)} 上游故障"
+                f"（{reason}），换下一个账号"
+            )
+            continue
+        text = raw.decode("utf-8", "replace")
+        if (
+            status == 200
+            and _looks_like_content_filter_text(text)
+            and CONFIG.get("desensitize")
+            and CONFIG.get("no_compact")
+        ):
+            retry_body = _chat_body_desensitize(body, force_compact=True)
+            _log(
+                f"{prefix}↻ RESPONSES {model_name} | content filter detected, retry with compact harness"
+            )
+            _log_body(
+                f"{prefix}── RESPONSES RETRY CHAT BODY ──\n{json.dumps(retry_body, ensure_ascii=False, indent=2)}"
+            )
+            retry_status, retry_raw = await _post_backend_once(
+                url, headers, retry_body, proxy=acct.proxy, rid=rid, model_name=model_name
+            )
+            retry_text = retry_raw.decode("utf-8", "replace")
+            if retry_status == 200 and not _looks_like_content_filter_text(retry_text):
+                return retry_status, retry_raw, retry_body
+        return status, raw, body
+    _log(
+        f"{prefix}✗ 账号池已耗尽"
+        f"（已试：{','.join(account_pool.short_uid(u) for u in tried) or '无可用账号'}），"
+        f"请求直接失败"
+    )
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "error": {
+                "message": "all accounts unavailable"
+                + (f": {last_fault.reason}" if last_fault else "（池中无可用账号）"),
+                "type": "account_pool_exhausted",
+            }
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1921,7 +2116,7 @@ async def create_response(
     转换为 Responses 语义事件流返回。
     """
     _check_auth(authorization, x_api_key, api_key)
-    cred = _cred()
+    pool = _pool()
 
     try:
         payload = await request.json()
@@ -1977,21 +2172,21 @@ async def create_response(
         f"[{rid}] ── RESPONSES → CHAT BODY ──\n{json.dumps(chat_body, ensure_ascii=False, indent=2)}"
     )
 
-    headers = cred.get_headers()
     url = f"{BACKEND}/v2/chat/completions"
     t0 = time.time()
 
     if client_wants_stream:
         return StreamingResponse(
-            _stream_responses(url, headers, chat_body, model_name, t0, rid),
+            _stream_responses(url, pool, chat_body, model_name, t0, rid),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
     # 非流式：聚合后端 SSE → 非流式 Response 对象
+    # （换号逻辑在 _post_backend_with_filter_retry 里；池耗尽时抛 503）
     try:
         status_code, raw, final_body = await _post_backend_with_filter_retry(
-            url, headers, chat_body, rid, model_name
+            url, pool, chat_body, rid, model_name
         )
         if status_code != 200:
             _log(
@@ -2026,19 +2221,22 @@ async def create_response(
 
 async def _stream_responses(
     url: str,
-    headers: dict,
+    pool,
     body: dict,
     model_name: str = "?",
     t0: float = 0.0,
     rid: str = "",
 ):
-    """消费后端 Chat SSE，实时转换为 Responses API 事件流输出。"""
+    """消费后端 Chat SSE，实时转换为 Responses API 事件流输出。
+
+    pool：账号池（换号逻辑在 _post_backend_with_filter_retry 里）。
+    """
     converter = ResponsesStreamConverter(model=model_name)
     prefix = f"[{rid}] " if rid else ""
 
     try:
         status_code, raw, _ = await _post_backend_with_filter_retry(
-            url, headers, body, rid, model_name
+            url, pool, body, rid, model_name
         )
         if status_code != 200:
             _log(
@@ -2060,6 +2258,14 @@ async def _stream_responses(
             events = converter.feed_line(line)
             if events:
                 yield events.encode("utf-8")
+    except HTTPException as e:
+        # 账号池耗尽（503）：响应头已发出，只能发错误事件，不能抛异常
+        detail = e.detail if isinstance(e.detail, dict) else {}
+        msg = str((detail.get("error") or {}).get("message") or "upstream error")
+        _log(f"{prefix}✗ {msg}")
+        error_evt = {"type": "error", "error": {"message": msg[:500], "code": e.status_code}}
+        yield f"data: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
+        return
     except httpx.HTTPError as e:
         _log(f"{prefix}✗ 网络错误 | {model_name} | {type(e).__name__}: {e}")
         error_evt = {"type": "error", "error": {"message": str(e)[:500], "code": 502}}
@@ -2096,7 +2302,7 @@ async def create_message(
     转换为 Anthropic SSE 事件流返回。
     """
     _check_auth(authorization, x_api_key, api_key)
-    cred = _cred()
+    pool = _pool()
 
     try:
         payload = await request.json()
@@ -2163,37 +2369,48 @@ async def create_message(
         f"[{rid}] ── ANTHROPIC → CHAT BODY ──\n{json.dumps(chat_body, ensure_ascii=False, indent=2)}"
     )
 
-    headers = cred.get_headers()
     url = f"{BACKEND}/v2/chat/completions"
     t0 = time.time()
 
     # 如果用户请求流式响应，直接返回流式
     if user_stream:
         return StreamingResponse(
-            _stream_anthropic(url, headers, chat_body, model_name, t0, rid),
+            _stream_anthropic(url, pool, chat_body, model_name, t0, rid),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    # 否则，收集完整响应并返回 JSON
+    # 否则，收集完整响应并返回 JSON（账号级故障走换号，池耗尽抛 503）
     from fastapi.responses import JSONResponse
 
-    response_data = await _collect_anthropic_nonstream(
-        url, headers, chat_body, model_name, t0, rid
+    response_data = await _with_account_rotation(
+        pool,
+        rid=rid,
+        model_name=model_name,
+        attempt=lambda acct: _anthropic_nonstream_once(
+            acct, url, chat_body, model_name, t0, rid
+        ),
     )
     return JSONResponse(content=response_data)
 
 
-async def _collect_anthropic_nonstream(
+async def _anthropic_nonstream_once(
+    acct,
     url: str,
-    headers: dict,
     body: dict,
     model_name: str = "?",
     t0: float = 0.0,
     rid: str = "",
 ) -> dict:
-    """收集完整的流式响应并返回非流式 Anthropic Message 对象。"""
+    """用指定账号收集完整的流式响应并返回非流式 Anthropic Message 对象。
+
+    网络错误在同账号内重试；上游非 200 先做账号级故障分类 —— 命中则抛
+    AccountFaultError（外层换号），否则保持原有的 HTTPException 透传。
+    """
     prefix = f"[{rid}] " if rid else ""
+    headers = _account_headers(acct, rid=rid)
+    if headers is None:
+        raise account_pool.AccountFaultError(acct.uid, "取凭据/刷新失败")
 
     # 整个响应聚合完才返回给客户端 —— 网络错误可安全重试（converter 每次新建）。
     retries = max(0, int(CONFIG.get("stream_retry", 1)))
@@ -2201,13 +2418,18 @@ async def _collect_anthropic_nonstream(
     for attempt in range(1, retries + 2):
         converter = AnthropicStreamConverter(model=model_name)
         try:
-            async with environments.make_async_client(CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=_upstream_timeout(120.0)) as c:
+            async with environments.make_async_client(CONFIG.get("env"), proxy=acct.proxy, timeout=_upstream_timeout(120.0)) as c:
                 async with c.stream("POST", url, headers=headers, json=body) as r:
                     if r.status_code != 200:
                         err = await r.aread()
                         _log(
                             f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8', 'replace'), 200)}"
                         )
+                        reason = account_pool.classify_account_fault(r.status_code, err)
+                        if reason is not None:
+                            raise account_pool.AccountFaultError(
+                                acct.uid, reason, r.status_code, err
+                            )
                         raise HTTPException(
                             status_code=r.status_code,
                             detail={
@@ -2245,7 +2467,7 @@ async def _collect_anthropic_nonstream(
 
 async def _stream_anthropic(
     url: str,
-    headers: dict,
+    pool,
     body: dict,
     model_name: str = "?",
     t0: float = 0.0,
@@ -2256,39 +2478,73 @@ async def _stream_anthropic(
     网络错误自动重试（与 _stream_upstream 同规则）：只在**还没向客户端发出任何
     字节**时重试。converter 每次尝试都新建 —— feed_line 可能已缓冲事件但尚未吐出，
     复用旧实例会把上一次尝试的状态带进来。
+
+    pool：账号池。上游在首字节前回账号级故障时禁用并换号；
+    流开始转发后绝不换号。
     """
     prefix = f"[{rid}] " if rid else ""
     terminal = False  # True = 非 200 的错误事件已发给客户端
     converter = None
 
+    def _error_event(message: str, code: int) -> bytes:
+        error_evt = {
+            "type": "error",
+            "error": {"message": message[:500], "type": "api_error", "code": code},
+        }
+        return f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
+
+    async def _attempt(acct, box):
+        nonlocal terminal, converter
+        headers = _account_headers(acct, rid=rid)
+        if headers is None:
+            pool.mark_account_fault(acct.uid, "取凭据/刷新失败")
+            _log(f"{prefix}⇄ 账号 {account_pool.short_uid(acct.uid)} 取凭据失败，换下一个账号")
+            box["rotate"] = True
+            return
+        pool.note_attempt(acct.uid)
+        converter = AnthropicStreamConverter(model=model_name)
+        async with environments.make_async_client(CONFIG.get("env"), proxy=acct.proxy, timeout=_upstream_timeout(None)) as c:
+            async with c.stream("POST", url, headers=headers, json=body) as r:
+                if r.status_code != 200:
+                    err = await r.aread()
+                    reason = account_pool.classify_account_fault(r.status_code, err)
+                    if reason is not None:
+                        pool.mark_account_fault(acct.uid, reason, http_status=r.status_code)
+                        _log(
+                            f"{prefix}⇄ 账号 {account_pool.short_uid(acct.uid)} 上游故障"
+                            f"（{reason}），换下一个账号"
+                        )
+                        box["rotate"] = True
+                        return
+                    _log(
+                        f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8', 'replace'), 200)}"
+                    )
+                    terminal = True
+                    yield _error_event(err.decode("utf-8", "replace"), r.status_code)
+                    return
+                async for line in r.aiter_lines():
+                    events = converter.feed_line(line)
+                    if events:
+                        yield events.encode("utf-8")
+
     retries = max(0, int(CONFIG.get("stream_retry", 1)))
     for attempt in range(1, retries + 2):
         sent_any = False
-        converter = AnthropicStreamConverter(model=model_name)
         try:
-            async with environments.make_async_client(CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=_upstream_timeout(None)) as c:
-                async with c.stream("POST", url, headers=headers, json=body) as r:
-                    if r.status_code != 200:
-                        err = await r.aread()
-                        _log(
-                            f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8', 'replace'), 200)}"
-                        )
-                        error_evt = {
-                            "type": "error",
-                            "error": {
-                                "message": err.decode("utf-8", "replace")[:500],
-                                "type": "api_error",
-                                "code": r.status_code,
-                            },
-                        }
-                        terminal = True
-                        yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
-                        break
-                    async for line in r.aiter_lines():
-                        events = converter.feed_line(line)
-                        if events:
-                            sent_any = True
-                            yield events.encode("utf-8")
+            exhausted = True
+            for acct in pool.ordered_available():
+                box = {"rotate": False}
+                async for chunk in _attempt(acct, box):
+                    sent_any = True
+                    yield chunk
+                if not box["rotate"]:
+                    exhausted = False
+                    break
+            if exhausted:
+                _log(f"{prefix}✗ 账号池已耗尽，请求直接失败")
+                terminal = True
+                yield _error_event("all accounts unavailable", 503)
+                return
             break  # 正常走完
         except httpx.HTTPError as e:
             if sent_any or attempt > retries:
@@ -2296,11 +2552,7 @@ async def _stream_anthropic(
                     f"{prefix}✗ 网络错误 | {model_name} | {type(e).__name__}: {e}"
                     + ("；已转发部分数据，无法安全重试" if sent_any else "；重试后仍失败")
                 )
-                error_evt = {
-                    "type": "error",
-                    "error": {"message": str(e)[:500], "type": "api_error", "code": 502},
-                }
-                yield f"event: error\ndata: {json.dumps(error_evt, ensure_ascii=False)}\n\n".encode()
+                yield _error_event(str(e), 502)
                 return
             _log(
                 f"{prefix}↻ 网络错误（首字节前）| {model_name} | {type(e).__name__}: {e}"
@@ -2331,7 +2583,15 @@ async def count_tokens(
     后端只支持流式请求，所以我们发送流式请求并从中提取 usage。
     """
     _check_auth(authorization, x_api_key, api_key)
-    cred = _cred()
+    # 用池当前首选账号（协议格式不变，只换凭据和代理的来源）。
+    pool = _pool()
+    acct = pool.default_account()
+    if acct is None:
+        raise HTTPException(
+            status_code=503,
+            detail={"error": {"message": "all accounts unavailable", "type": "auth_error"}},
+        )
+    cred = acct.cred
 
     try:
         payload = await request.json()
@@ -2389,7 +2649,7 @@ async def count_tokens(
     url = f"{BACKEND}/v2/chat/completions"
 
     try:
-        async with environments.make_async_client(CONFIG.get("env"), proxy=CONFIG.get("proxy"), timeout=30.0) as client:
+        async with environments.make_async_client(CONFIG.get("env"), proxy=acct.proxy, timeout=30.0) as client:
             async with client.stream(
                 "POST", url, headers=headers, json=chat_body
             ) as resp:
@@ -2526,6 +2786,27 @@ def preflight() -> bool:
     return ok
 
 
+def _sync_default_cred():
+    """把 CONFIG["cred"] 同步到池当前首选账号的凭据管理器。
+
+    CONFIG["cred"] 的语义是"首选账号的凭据管理器"，供 /health 凭据摘要、
+    模型预热、count_tokens 等旧调用点用。池的 default_uid 会在账号故障时
+    自动改指（mark_account_fault）或配置重载时变化，所以这里必须动态跟随，
+    不能只在启动时赋值一次。
+    """
+    pool = CONFIG.get("pool")
+    acct = pool.default_account() if pool is not None else None
+    CONFIG["cred"] = acct.cred if acct is not None else None
+
+
+def _pool_changed():
+    """账号池 on_change 回调：禁用/换首选/配置重载/重新登录恢复都会触发。"""
+    _sync_default_cred()
+    snap = CONFIG.get("snapshot")
+    if snap is not None:
+        snap.request()  # 纯观测用途的快照刷新；持久化池自己已同步写完
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="CodeBuddy -> OpenAI 兼容转换器（直连后端）"
@@ -2604,8 +2885,17 @@ def main():
         "--state-file",
         default=os.environ.get("CODEBUDDY2OPENAI_STATE_FILE") or None,
         metavar="PATH",
-        help="状态快照路径（记录可用模型 / 积分余额 / 任务状态）。"
+        help="状态快照路径（记录可用模型 / 积分余额 / 任务状态 / 账号池状态）。"
         "默认与 --log 同目录的 state.json；给目录则用其中的 state.json。",
+    )
+    ap.add_argument(
+        "--accounts-file",
+        default=os.environ.get("CODEBUDDY2OPENAI_ACCOUNTS_FILE") or None,
+        metavar="PATH",
+        help="多账号配置文件（accounts.json，热加载，改完即生效，无需重启）。"
+        "默认在 auth 目录旁按环境查找 accounts-<env>.json（不存在则回落 accounts.json）；"
+        "文件不存在时优雅降级为单账号模式（沿用现有凭据解析）。"
+        "也可用环境变量 CODEBUDDY2OPENAI_ACCOUNTS_FILE。",
     )
     ap.add_argument(
         "--state-interval",
@@ -2830,9 +3120,43 @@ def main():
             f"       （未选中的：{', '.join(_others) or '无'}）。\n"
         )
     CONFIG["auth_file"] = str(af) if af else None
-    CONFIG["cred"] = (
-        CredentialManager(af, env=env_name, proxy=proxy_url) if af else None
+
+    # 状态文件路径（账号池的 account_pool 段与状态快照共用这一个文件，R5）。
+    # 先算出来：池构造时就要读它恢复禁用状态与首选。
+    state_target = args.state_file or CONFIG.get("log_path")
+    state_path = state_snapshot.snapshot_path(state_target)
+
+    # ---- 多账号池（R2）----
+    # 配置文件默认在 auth 目录旁、按环境区分文件名（双实例共用 /data/auth 卷，
+    # 不区分文件名的话 intl 容器会读到 cn 的账号 —— 容器隔离了 realm 但文件是共享的）。
+    _auth_root = os.environ.get("CODEBUDDY_AUTH_DIR")
+    if not _auth_root:
+        _auth_dirs = auth_dirs(env_name)
+        _auth_root = str(_auth_dirs[0]) if _auth_dirs else None
+    accounts_file = (
+        args.accounts_file
+        or os.environ.get(account_pool.ACCOUNTS_FILE_ENV_KEY)
+        or account_pool.default_accounts_path(_auth_root, env_name)
     )
+    pool = account_pool.AccountPool(
+        env=env_name,
+        config_path=accounts_file,
+        state_path=state_path,
+        default_proxy=proxy_url,
+        legacy_auth_path=af,
+        cred_factory=lambda path, proxy: CredentialManager(path, env=env_name, proxy=proxy),
+        log=_log,
+        # 池状态变化（禁用/换首选/配置重载/重新登录恢复）后的同步：
+        # 1. 请求一次快照刷新（纯观测用途；真正的持久化池自己已经同步写完）；
+        # 2. 刷新 CONFIG["cred"] —— 它是"首选账号的凭据管理器"语义，首选变了
+        #    它必须跟着变，否则 /health 凭据摘要、模型预热、count_tokens 等
+        #    旧调用点会继续拿着被禁用的老账号。
+        on_change=_pool_changed,
+    )
+    CONFIG["pool"] = pool
+    # 兼容旧调用点（/health 凭据摘要、模型预热、count_tokens 等）：
+    # CONFIG["cred"] 永远指向"当前首选账号的凭据管理器"。
+    _sync_default_cred()
 
     # 动态模型注册表（上游拉取 + 内存缓存 + 落盘快照 + 多级回退）
     # on_resolve：registry 的任何产出路径（含 warm 后台线程）都登记一次，
@@ -2886,6 +3210,8 @@ def main():
             cache_dir=registry.cache_dir,
             run_on_start=("checkin",) if args.checkin_on_start else (),
             log=_log,
+            # 账号池注入：六类任务按账号循环，每个账号用自己的代理（R4）
+            pool=pool,
             # 每类任务跑完就刷新一次状态快照 —— 积分正是在这些时点变化的
             on_result=lambda _k, _r: _request_snapshot(),
         )
@@ -2905,8 +3231,7 @@ def main():
     # 状态快照（logs/state.json）：把「可用模型 / 积分余额 / 任务状态」落成文件。
     # 路径默认跟 --log 同目录 —— 这样不必新增挂载：compose 已经挂了 logs/，
     # 快照自然跟着可见、跟着持久化。--state-file 可显式覆盖。
-    state_target = args.state_file or CONFIG.get("log_path")
-    state_path = state_snapshot.snapshot_path(state_target)
+    # （state_target / state_path 已在账号池装配处算好 —— 池要先读它恢复状态。）
     # 模型能力表（logs/model_capabilities.json + .md）：上下文窗口 + 思考强度。
     # 与快照同目录策略 —— 不新增挂载。没配日志目录就不启用。
     # ⚠️ 必须在 writer.tick() 之前赋值：tick 会经 _collect_state 触发首次模型解析，
@@ -2939,11 +3264,12 @@ def main():
     # UA 版本运行时覆盖：上游 CLI 升级时改配置即可，不必改代码重新打包。
     # （/v3/config 的 UA 门槛只校验形态不校验版本号，所以这只影响「对齐语义」。）
     model_registry.set_cli_version(args.ua_version)
-    # 版本文件（热读取）：默认与日志同目录（logs/ 已挂载，File Station 直接改）。
-    # 改完下一个请求就生效 —— 不用重启容器，更不用重建。
-    _ua_file = args.ua_version_file or (
-        str(Path(CONFIG["log_path"]).with_name("ua-version.txt"))
-        if CONFIG.get("log_path") else None
+    # 版本文件（热读取，R1）：默认与日志同目录的 ua-version-<env>.txt
+    # （双实例共用 /logs 卷，不按环境区分会被另一边抢）；
+    # 派生名不存在则回落 ua-version.txt（向后兼容）。
+    # logs/ 已挂载，File Station 改完下一个请求就生效 —— 不用重启容器，更不用重建。
+    _ua_file = args.ua_version_file or model_registry.default_version_file(
+        CONFIG.get("log_path"), env_name
     )
     model_registry.set_cli_version_file(_ua_file)
 
@@ -2986,6 +3312,22 @@ def main():
     sys.stderr.write(f"   chat 域   : {_env_desc['bases']['chat']}\n")
     sys.stderr.write(f"   billing 域: {_env_desc['bases']['billing']}\n")
     sys.stderr.write(f"   凭据文件  : {af or '(未找到)'}\n")
+    _pool_st = pool.status()
+    if _pool_st["multi_mode"]:
+        _pool_accts = ",".join(
+            account_pool.short_uid(a["uid"]) + ("(禁)" if a["disabled"] else "")
+            for a in _pool_st["accounts"]
+        )
+        sys.stderr.write(
+            f"   账号池    : 多账号模式（{accounts_file}）\n"
+            f"               {_pool_st['available']}/{_pool_st['total']} 可用，"
+            f"首选={account_pool.short_uid(_pool_st['default_uid'])}，"
+            f"账号=[{_pool_accts}]（各账号代理独立绑定）\n"
+        )
+    else:
+        sys.stderr.write(
+            f"   账号池    : 单账号模式（未找到 {Path(accounts_file).name if accounts_file else 'accounts.json'}，沿用现有凭据）\n"
+        )
     sys.stderr.write(
         f"   代理      : {_env_desc['proxy'] or '直连'}"
         + ("（密码已脱敏）" if "@" in (proxy_url or "") else "")

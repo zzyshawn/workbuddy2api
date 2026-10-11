@@ -34,6 +34,10 @@ import time
 from pathlib import Path
 from typing import Callable
 
+# 账号池状态段与快照共用一个 state 文件，写盘时用它的文件锁互斥
+# （account_pool 不 import 本模块，无循环导入之忧）。
+from account_pool import state_file_lock
+
 #: 快照文件名。放日志目录下，跟着 logs/ 一起挂载。
 SNAPSHOT_NAME = "state.json"
 
@@ -118,6 +122,7 @@ def build_snapshot(
     credential: dict | None = None,
     checkin: dict | None = None,
     tasks: dict | None = None,
+    account_pool: dict | None = None,
     now: float | None = None,
 ) -> dict:
     """把各来源状态拼成快照 dict。
@@ -126,10 +131,11 @@ def build_snapshot(
     这样测试可以直接喂构造数据，不用起服务、不用真凭据。
 
     入参约定（都允许缺省，缺省的部分在输出里表现为 null / 空列表）：
-      - models     : {"ids": [...], "source": "upstream", "at": <ts>, "error": <str>}
-      - credential : CredentialManager.summary() 的结果
-      - checkin    : CheckinScheduler.status() 的结果（读其中的 points / last / enabled …）
-      - tasks      : TaskScheduler.status() 的结果
+      - models       : {"ids": [...], "source": "upstream", "at": <ts>, "error": <str>}
+      - credential   : CredentialManager.summary() 的结果
+      - checkin      : CheckinScheduler.status() 的结果（读其中的 points / last / enabled …）
+      - tasks        : TaskScheduler.status() 的结果
+      - account_pool : AccountPool.status() 的结果（多账号状态：禁用/首选/计数）
     """
     ts = time.time() if now is None else float(now)
     models = models or {}
@@ -217,6 +223,12 @@ def build_snapshot(
             "last": ran or None,
         }
 
+    # 账号池状态（AccountPool.status()）。注意：快照里这份是"观测副本"，
+    # 真正的持久化由 AccountPool.save_state() 同步写 —— 两边写同一个文件，
+    # 靠 account_pool.state_file_lock() 互斥，见 SnapshotWriter.tick()。
+    if account_pool is not None:
+        snap["account_pool"] = account_pool
+
     return snap
 
 
@@ -272,24 +284,34 @@ class SnapshotWriter(threading.Thread):
             self.tick()
 
     def tick(self) -> bool:
-        """采集一次并写盘。返回是否写成功。"""
+        """采集一次并写盘。返回是否写成功。
+
+        持 account_pool.state_file_lock() 写盘：账号池的 save_state() 会在
+        禁用/换首选时同步往**同一个文件**写它的 account_pool 段；
+        不加锁的话，"快照读→池写→快照写"会把池刚落盘的变更吞掉
+        （禁用重启后复活 —— 验收自查第 4 条的反例）。
+        """
         if self.before_build is not None:
             try:
                 self.before_build()
             except Exception as e:  # noqa: BLE001 — 刷新失败不阻断写盘（用旧值也比没有强）
                 self._log(f"[state] WARN 刷新积分失败：{e}")
         try:
-            data = self.build()
-        except Exception as e:  # noqa: BLE001
-            self.failures += 1
-            self.last_error = f"采集失败：{e}"
-            self._log(f"[state] ERR 采集失败：{e}")
-            return False
-        if write_atomic(self.path, data):
-            self.writes += 1
-            self.last_write_ts = time.time()
-            self.last_error = None
-            return True
+            with state_file_lock(self.path):
+                try:
+                    data = self.build()
+                except Exception as e:  # noqa: BLE001
+                    self.failures += 1
+                    self.last_error = f"采集失败：{e}"
+                    self._log(f"[state] ERR 采集失败：{e}")
+                    return False
+                if write_atomic(self.path, data):
+                    self.writes += 1
+                    self.last_write_ts = time.time()
+                    self.last_error = None
+                    return True
+        except Exception as e:  # noqa: BLE001 — 锁本身不该抛，但防一手
+            self._log(f"[state] ERR 写盘异常：{e}")
         self.failures += 1
         self.last_error = f"写入失败：{self.path}"
         self._log(f"[state] ERR 写入失败：{self.path}")
