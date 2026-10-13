@@ -828,6 +828,13 @@ CONFIG: dict = {
     "stream_retry": 5,
     #: 重试间隔基数（秒），指数退避：2/4/8/16/30（封顶 30s）。0 = 不等待立即重试。
     "stream_retry_gap": 2.0,
+    #: 429 限流处理（改进 A，2026-10-13）：429 带 retry_policy.retry=true，是「稍后
+    #: 重试可自愈」而非确定性拒绝 —— 当天日志 intl 5 次 429 全部原样透传给客户端。
+    #: 策略（用户拍板）：**429 优先换下一个账号**（不禁号，号本身是好的）；
+    #: 池里整圈全 429 才退避 rate_limit_retry_gap 秒再来一轮，至多 rate_limit_retry
+    #: 轮，用尽才把 429 透传。0 = 关闭退避轮（圈内的账号间轮换不受影响）。
+    "rate_limit_retry": 2,
+    "rate_limit_retry_gap": 20.0,
     #: 流式上游 read 空闲超时（秒）：两次字节之间的最大间隔。SOCKS5 隧道静默
     #: 死亡（TCP 半开）时 read 会永远阻塞，客户端停在「等待模型响应」；
     #: 600s 内一个字节都没有基本可断定链路死了。0 = 不限（恢复旧行为）。
@@ -914,6 +921,18 @@ async def _retry_wait(attempt: int) -> None:
     gap = max(0.0, float(CONFIG.get("stream_retry_gap", 2)))
     if gap > 0:
         await asyncio.sleep(min(gap * (2 ** (attempt - 1)), 30.0))
+
+
+def _rate_limit_policy() -> tuple[int, float]:
+    """429 限流处理的 (退避轮数上限, 每轮退避秒)。
+
+    语义（改进 A，2026-10-13）：429 不是账号级故障（号是好的），优先换下一个
+    账号；整圈全 429 才退避重试，至多 rate_limit_retry 轮。见 CONFIG 注释。
+    """
+    return (
+        max(0, int(CONFIG.get("rate_limit_retry", 2))),
+        max(1.0, float(CONFIG.get("rate_limit_retry_gap", 20.0))),
+    )
 
 
 def _pad_label(s: str, width: int = 16) -> str:
@@ -1071,19 +1090,53 @@ async def _with_account_rotation(pool, *, rid: str, model_name: str, attempt):
     """
     last_fault: account_pool.AccountFaultError | None = None
     tried: list[str] = []
-    for acct in pool.ordered_available():
-        tried.append(acct.uid)
-        pool.note_attempt(acct.uid)
-        try:
-            return await attempt(acct)
-        except account_pool.AccountFaultError as e:
-            last_fault = e
-            pool.mark_account_fault(e.uid, e.reason, http_status=e.http_status)
+    rl_retries, rl_gap = _rate_limit_policy()
+    rl_round = 0
+    while True:
+        #: 本轮是否只出现 429（只要有一个非 429 结局就不做限流退避 —— 故障是
+        #: 确定性的，退避没有意义；429 是频率性的，退避 + 换号能自愈）。
+        all_rate_limited = True
+        for acct in pool.ordered_available():
+            tried.append(acct.uid)
+            pool.note_attempt(acct.uid)
+            try:
+                return await attempt(acct)
+            except account_pool.AccountFaultError as e:
+                all_rate_limited = False
+                last_fault = e
+                pool.mark_account_fault(e.uid, e.reason, http_status=e.http_status)
+                _log(
+                    f"[{rid}] ⇄ 账号 {account_pool.short_uid(e.uid)} 上游故障"
+                    f"（{e.reason}），同一请求内换下一个账号"
+                )
+                continue
+            except account_pool.RateLimitedError as e:
+                _log(
+                    f"[{rid}] ⇄ 账号 {account_pool.short_uid(e.uid)} 429 限流，"
+                    f"同一请求内换下一个账号（不禁号）"
+                )
+                continue
+        #: 一圈结束：全 429 → 退避再来一轮；否则按原语义失败/返回。
+        if all_rate_limited and tried and rl_round < rl_retries:
+            rl_round += 1
             _log(
-                f"[{rid}] ⇄ 账号 {account_pool.short_uid(e.uid)} 上游故障"
-                f"（{e.reason}），同一请求内换下一个账号"
+                f"[{rid}] ↻ 全部账号 429 限流，退避 {rl_gap:.0f}s 后重试"
+                f"第 {rl_round}/{rl_retries} 轮"
             )
+            await asyncio.sleep(rl_gap)
             continue
+        break
+    if all_rate_limited and tried:
+        # 整圈全 429 且退避轮用尽：透传 429（比 503 更贴切 —— 客户端知道稍后重试）。
+        _log(
+            f"[{rid}] ✗ 全部账号 429 限流"
+            f"（已试：{','.join(account_pool.short_uid(u) for u in tried)}），"
+            f"退避重试轮次用尽，透传"
+        )
+        raise HTTPException(
+            status_code=429,
+            detail={"error": {"message": "all accounts rate limited", "type": "rate_limited"}},
+        )
     _log(
         f"[{rid}] ✗ 账号池已耗尽"
         f"（已试：{','.join(account_pool.short_uid(u) for u in tried) or '无可用账号'}），"
@@ -1734,6 +1787,12 @@ async def _chat_nonstream_once(acct, url: str, body: dict, model_name: str, rid:
                             raise account_pool.AccountFaultError(
                                 acct.uid, reason, r.status_code, raw
                             )
+                        # 429 → 抛 RateLimitedError 交给外层换号（不禁号）；
+                        # 池里整圈全 429 时由外层退避重试（_with_account_rotation）。
+                        if r.status_code == 429:
+                            raise account_pool.RateLimitedError(
+                                acct.uid, r.status_code, raw
+                            )
                         raise HTTPException(
                             status_code=r.status_code,
                             detail=_safe_err_raw(raw, r.status_code),
@@ -1868,6 +1927,15 @@ async def _stream_upstream(
                         )
                         box["rotate"] = True
                         return
+                    # 429 限流（改进 A）：不禁号，标记后由外层换下一个账号；
+                    # 整圈全 429 由外层退避重试（_rate_limit_policy）。
+                    if r.status_code == 429:
+                        box["rate_limited"] = True
+                        _log(
+                            f"{prefix}⇄ 账号 {account_pool.short_uid(acct.uid)} 429 限流，"
+                            f"换下一个账号（不禁号）"
+                        )
+                        return
                     _log(
                         f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8', 'replace'), 200)}"
                     )
@@ -1882,19 +1950,47 @@ async def _stream_upstream(
                         yield chunk
 
     retries = max(0, int(CONFIG.get("stream_retry", 1)))
-    for attempt in range(1, retries + 2):
+    rl_retries, rl_gap = _rate_limit_policy()
+    rl_round = 0
+    net_used = 0
+    while True:
         sent_any = False
         try:
+            all_rate_limited = True
+            any_acct = False
             exhausted = True
             for acct in pool.ordered_available():
-                box = {"rotate": False}
+                any_acct = True
+                box = {"rotate": False, "rate_limited": False}
                 async for chunk in _attempt(acct, box):
                     sent_any = True
                     yield chunk
+                if box.get("rate_limited"):
+                    # 429 限流（非账号故障）：不禁号，本轮继续换下一个账号。
+                    continue
+                all_rate_limited = False
                 if not box["rotate"]:
                     exhausted = False
                     break
             if exhausted:
+                if all_rate_limited and any_acct:
+                    # 整圈全 429 → 短退避后再来一轮（换号优先于透传，用户拍板）。
+                    if rl_round < rl_retries:
+                        rl_round += 1
+                        _log(
+                            f"{prefix}↻ 全部账号 429 限流，退避 {rl_gap:.0f}s 后重试"
+                            f"第 {rl_round}/{rl_retries} 轮"
+                        )
+                        await asyncio.sleep(rl_gap)
+                        continue
+                    _log(f"{prefix}✗ 全部账号 429 限流，退避重试轮次用尽，透传")
+                    terminal = True
+                    yield _err_event(
+                        b'{"error":{"message":"all accounts rate limited",'
+                        b'"type":"rate_limited"}}',
+                        429,
+                    )
+                    return
                 # 全部账号都撞上账号级故障（或池为空）→ 直接失败，不再重试换号
                 _log(f"{prefix}✗ 账号池已耗尽，请求直接失败")
                 terminal = True
@@ -1906,7 +2002,8 @@ async def _stream_upstream(
                 return
             break  # 正常走完
         except httpx.HTTPError as e:
-            if sent_any or attempt > retries:
+            net_used += 1
+            if sent_any or net_used > retries:
                 _log(
                     f"{prefix}✗ 网络错误 | {model_name} | {type(e).__name__}: {e}"
                     + ("；已转发部分数据，无法安全重试" if sent_any else "；重试后仍失败")
@@ -1915,9 +2012,9 @@ async def _stream_upstream(
                 return
             _log(
                 f"{prefix}↻ 网络错误（首字节前）| {model_name} | {type(e).__name__}: {e}"
-                f" | 自动重试 {attempt}/{retries}"
+                f" | 自动重试 {net_used}/{retries}"
             )
-            await _retry_wait(attempt)
+            await _retry_wait(net_used)
     if terminal:
         return
 
@@ -2039,47 +2136,81 @@ async def _post_backend_with_filter_retry(
     prefix = f"[{rid}] " if rid else ""
     last_fault: account_pool.AccountFaultError | None = None
     tried: list[str] = []
-    for acct in pool.ordered_available():
-        tried.append(acct.uid)
-        pool.note_attempt(acct.uid)
-        headers = _account_headers(acct, rid=rid)
-        if headers is None:
-            pool.mark_account_fault(acct.uid, "取凭据/刷新失败")
-            _log(f"{prefix}⇄ 账号 {account_pool.short_uid(acct.uid)} 取凭据失败，换下一个账号")
+    rl_retries, rl_gap = _rate_limit_policy()
+    rl_round = 0
+    while True:
+        #: 语义同 _with_account_rotation：本轮只出现 429 才做限流退避重试。
+        all_rate_limited = True
+        for acct in pool.ordered_available():
+            tried.append(acct.uid)
+            pool.note_attempt(acct.uid)
+            headers = _account_headers(acct, rid=rid)
+            if headers is None:
+                all_rate_limited = False
+                pool.mark_account_fault(acct.uid, "取凭据/刷新失败")
+                _log(f"{prefix}⇄ 账号 {account_pool.short_uid(acct.uid)} 取凭据失败，换下一个账号")
+                continue
+            status, raw = await _post_backend_once(
+                url, headers, body, proxy=acct.proxy, rid=rid, model_name=model_name
+            )
+            reason = account_pool.classify_account_fault(status, raw)
+            if reason is not None:
+                all_rate_limited = False
+                last_fault = account_pool.AccountFaultError(acct.uid, reason, status, raw)
+                pool.mark_account_fault(acct.uid, reason, http_status=status)
+                _log(
+                    f"{prefix}⇄ 账号 {account_pool.short_uid(acct.uid)} 上游故障"
+                    f"（{reason}），换下一个账号"
+                )
+                continue
+            if status == 429:
+                # 429 限流：不禁号，本次请求换下一个账号；整圈全 429 由外层退避重试。
+                _log(
+                    f"{prefix}⇄ 账号 {account_pool.short_uid(acct.uid)} 429 限流，"
+                    f"换下一个账号（不禁号）"
+                )
+                continue
+            all_rate_limited = False
+            text = raw.decode("utf-8", "replace")
+            if (
+                status == 200
+                and _looks_like_content_filter_text(text)
+                and CONFIG.get("desensitize")
+                and CONFIG.get("no_compact")
+            ):
+                retry_body = _chat_body_desensitize(body, force_compact=True)
+                _log(
+                    f"{prefix}↻ RESPONSES {model_name} | content filter detected, retry with compact harness"
+                )
+                _log_body(
+                    f"{prefix}── RESPONSES RETRY CHAT BODY ──\n{json.dumps(retry_body, ensure_ascii=False, indent=2)}"
+                )
+                retry_status, retry_raw = await _post_backend_once(
+                    url, headers, retry_body, proxy=acct.proxy, rid=rid, model_name=model_name
+                )
+                retry_text = retry_raw.decode("utf-8", "replace")
+                if retry_status == 200 and not _looks_like_content_filter_text(retry_text):
+                    return retry_status, retry_raw, retry_body
+            return status, raw, body
+        if all_rate_limited and tried and rl_round < rl_retries:
+            rl_round += 1
+            _log(
+                f"{prefix}↻ 全部账号 429 限流，退避 {rl_gap:.0f}s 后重试"
+                f"第 {rl_round}/{rl_retries} 轮"
+            )
+            await asyncio.sleep(rl_gap)
             continue
-        status, raw = await _post_backend_once(
-            url, headers, body, proxy=acct.proxy, rid=rid, model_name=model_name
+        break
+    if all_rate_limited and tried:
+        _log(
+            f"{prefix}✗ 全部账号 429 限流"
+            f"（已试：{','.join(account_pool.short_uid(u) for u in tried)}），"
+            f"退避重试轮次用尽，透传"
         )
-        reason = account_pool.classify_account_fault(status, raw)
-        if reason is not None:
-            last_fault = account_pool.AccountFaultError(acct.uid, reason, status, raw)
-            pool.mark_account_fault(acct.uid, reason, http_status=status)
-            _log(
-                f"{prefix}⇄ 账号 {account_pool.short_uid(acct.uid)} 上游故障"
-                f"（{reason}），换下一个账号"
-            )
-            continue
-        text = raw.decode("utf-8", "replace")
-        if (
-            status == 200
-            and _looks_like_content_filter_text(text)
-            and CONFIG.get("desensitize")
-            and CONFIG.get("no_compact")
-        ):
-            retry_body = _chat_body_desensitize(body, force_compact=True)
-            _log(
-                f"{prefix}↻ RESPONSES {model_name} | content filter detected, retry with compact harness"
-            )
-            _log_body(
-                f"{prefix}── RESPONSES RETRY CHAT BODY ──\n{json.dumps(retry_body, ensure_ascii=False, indent=2)}"
-            )
-            retry_status, retry_raw = await _post_backend_once(
-                url, headers, retry_body, proxy=acct.proxy, rid=rid, model_name=model_name
-            )
-            retry_text = retry_raw.decode("utf-8", "replace")
-            if retry_status == 200 and not _looks_like_content_filter_text(retry_text):
-                return retry_status, retry_raw, retry_body
-        return status, raw, body
+        raise HTTPException(
+            status_code=429,
+            detail={"error": {"message": "all accounts rate limited", "type": "rate_limited"}},
+        )
     _log(
         f"{prefix}✗ 账号池已耗尽"
         f"（已试：{','.join(account_pool.short_uid(u) for u in tried) or '无可用账号'}），"
@@ -2430,6 +2561,11 @@ async def _anthropic_nonstream_once(
                             raise account_pool.AccountFaultError(
                                 acct.uid, reason, r.status_code, err
                             )
+                        # 429 → RateLimitedError 交给外层换号（同 _chat_nonstream_once）。
+                        if r.status_code == 429:
+                            raise account_pool.RateLimitedError(
+                                acct.uid, r.status_code, err
+                            )
                         raise HTTPException(
                             status_code=r.status_code,
                             detail={
@@ -2516,6 +2652,15 @@ async def _stream_anthropic(
                         )
                         box["rotate"] = True
                         return
+                    # 429 限流（改进 A）：不禁号，标记后由外层换下一个账号；
+                    # 整圈全 429 由外层退避重试（_rate_limit_policy）。
+                    if r.status_code == 429:
+                        box["rate_limited"] = True
+                        _log(
+                            f"{prefix}⇄ 账号 {account_pool.short_uid(acct.uid)} 429 限流，"
+                            f"换下一个账号（不禁号）"
+                        )
+                        return
                     _log(
                         f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8', 'replace'), 200)}"
                     )
@@ -2528,26 +2673,51 @@ async def _stream_anthropic(
                         yield events.encode("utf-8")
 
     retries = max(0, int(CONFIG.get("stream_retry", 1)))
-    for attempt in range(1, retries + 2):
+    rl_retries, rl_gap = _rate_limit_policy()
+    rl_round = 0
+    net_used = 0
+    while True:
         sent_any = False
         try:
+            all_rate_limited = True
+            any_acct = False
             exhausted = True
             for acct in pool.ordered_available():
-                box = {"rotate": False}
+                any_acct = True
+                box = {"rotate": False, "rate_limited": False}
                 async for chunk in _attempt(acct, box):
                     sent_any = True
                     yield chunk
+                if box.get("rate_limited"):
+                    # 429 限流（非账号故障）：不禁号，本轮继续换下一个账号。
+                    continue
+                all_rate_limited = False
                 if not box["rotate"]:
                     exhausted = False
                     break
             if exhausted:
+                if all_rate_limited and any_acct:
+                    # 整圈全 429 → 短退避后再来一轮（换号优先于透传，用户拍板）。
+                    if rl_round < rl_retries:
+                        rl_round += 1
+                        _log(
+                            f"{prefix}↻ 全部账号 429 限流，退避 {rl_gap:.0f}s 后重试"
+                            f"第 {rl_round}/{rl_retries} 轮"
+                        )
+                        await asyncio.sleep(rl_gap)
+                        continue
+                    _log(f"{prefix}✗ 全部账号 429 限流，退避重试轮次用尽，透传")
+                    terminal = True
+                    yield _error_event("all accounts rate limited", 429)
+                    return
                 _log(f"{prefix}✗ 账号池已耗尽，请求直接失败")
                 terminal = True
                 yield _error_event("all accounts unavailable", 503)
                 return
             break  # 正常走完
         except httpx.HTTPError as e:
-            if sent_any or attempt > retries:
+            net_used += 1
+            if sent_any or net_used > retries:
                 _log(
                     f"{prefix}✗ 网络错误 | {model_name} | {type(e).__name__}: {e}"
                     + ("；已转发部分数据，无法安全重试" if sent_any else "；重试后仍失败")
@@ -2556,9 +2726,9 @@ async def _stream_anthropic(
                 return
             _log(
                 f"{prefix}↻ 网络错误（首字节前）| {model_name} | {type(e).__name__}: {e}"
-                f" | 自动重试 {attempt}/{retries}"
+                f" | 自动重试 {net_used}/{retries}"
             )
-            await _retry_wait(attempt)
+            await _retry_wait(net_used)
     if terminal:
         return
 
@@ -2857,6 +3027,23 @@ def main():
         "也可用环境变量 CODEBUDDY2OPENAI_STREAM_RETRY_GAP。",
     )
     ap.add_argument(
+        "--rate-limit-retry",
+        type=int,
+        default=int(os.environ.get("CODEBUDDY2OPENAI_RATE_LIMIT_RETRY", 2)),
+        metavar="N",
+        help="429 限流的退避重试轮数（默认 2，0 = 关闭退避轮）。429 优先在池内"
+        "换下一个账号（不禁号）；整圈全 429 才退避重试，用尽才透传 429。"
+        "也可用环境变量 CODEBUDDY2OPENAI_RATE_LIMIT_RETRY。",
+    )
+    ap.add_argument(
+        "--rate-limit-retry-gap",
+        type=float,
+        default=float(os.environ.get("CODEBUDDY2OPENAI_RATE_LIMIT_RETRY_GAP", 20)),
+        metavar="SEC",
+        help="429 限流整圈退避的间隔秒数（默认 20）。"
+        "也可用环境变量 CODEBUDDY2OPENAI_RATE_LIMIT_RETRY_GAP。",
+    )
+    ap.add_argument(
         "--stream-read-timeout",
         type=float,
         default=float(os.environ.get("CODEBUDDY2OPENAI_STREAM_READ_TIMEOUT", 30)),
@@ -3106,6 +3293,8 @@ def main():
     CONFIG["log_bodies"] = bool(args.log_bodies)
     CONFIG["stream_retry"] = max(0, int(args.stream_retry))
     CONFIG["stream_retry_gap"] = max(0.0, float(args.stream_retry_gap))
+    CONFIG["rate_limit_retry"] = max(0, int(args.rate_limit_retry))
+    CONFIG["rate_limit_retry_gap"] = max(1.0, float(args.rate_limit_retry_gap))
     CONFIG["stream_read_timeout"] = max(0.0, float(args.stream_read_timeout))
     af = find_auth_file(env_name)
     # 同目录多凭据 → 认领结果可能不是你想要的，明确警告而不是静默取值。

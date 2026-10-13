@@ -117,6 +117,23 @@ class AccountFaultError(Exception):
         self.body = body
 
 
+class RateLimitedError(Exception):
+    """429 限流（**非**账号级故障）：不禁号，但本次请求应换下一个账号。
+
+    与 AccountFaultError 的本质区别：11140 是账号被上游封禁（永久禁用，
+    只有重新登录才能恢复），而 429 是「这个号暂时打太快」—— 号本身是好的，
+    换别的号继续、原号保留。池里一圈全 429 时由调用方短退避后重试
+    （CONFIG["rate_limit_retry"] 轮），用尽才把 429 透传给客户端。
+    """
+
+    def __init__(self, uid: str, http_status: int | None = None,
+                 body: bytes | None = None):
+        super().__init__(f"account {uid}: rate limited (429)")
+        self.uid = uid
+        self.http_status = http_status
+        self.body = body
+
+
 # ---------------------------------------------------------------------------
 # state 文件并发写保护
 # ---------------------------------------------------------------------------
