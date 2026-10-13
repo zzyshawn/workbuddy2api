@@ -135,8 +135,7 @@ def build_snapshot(
       - credential   : CredentialManager.summary() 的结果
       - checkin      : CheckinScheduler.status() 的结果（读其中的 points / last / enabled …）
       - tasks        : TaskScheduler.status() 的结果
-      - account_pool : AccountPool.status() 的结果（多账号状态：禁用/首选/计数）
-    """
+      - account_pool : AccountPool.status() 的结果（多账号状态：禁用/首选/计数）"""
     ts = time.time() if now is None else float(now)
     models = models or {}
     ids = [str(x) for x in (models.get("ids") or [])]
@@ -226,8 +225,12 @@ def build_snapshot(
     # 账号池状态（AccountPool.status()）。注意：快照里这份是"观测副本"，
     # 真正的持久化由 AccountPool.save_state() 同步写 —— 两边写同一个文件，
     # 靠 account_pool.state_file_lock() 互斥，见 SnapshotWriter.tick()。
+    # ⚠️ 键名必须是 account_pool_status 而不是 account_pool：池的持久化段
+    # （account_pool，dict 形态）由 save_state() 写、_restore_state_locked() 读；
+    # 快照这份是 status() 的 list 形态 —— 2026-10-14 踩坑：两种形态共用一个键，
+    # 快照后写覆盖池的 dict，重启恢复时 list.items() 直接 AttributeError 崩启动。
     if account_pool is not None:
-        snap["account_pool"] = account_pool
+        snap["account_pool_status"] = account_pool
 
     return snap
 

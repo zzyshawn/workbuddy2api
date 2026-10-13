@@ -589,7 +589,19 @@ class AccountPool:
         section = read_state_section(self.state_path, STATE_SECTION)
         if not section:
             return
-        saved_accounts = section.get("accounts") or {}
+        saved_accounts = section.get("accounts")
+        # 防御（2026-10-14 启动崩溃回归修复）：accounts 必须是 dict（uid → 状态）。
+        # 2026-10-14 实测：state_snapshot 曾把 status() 的 **list** 形态写进同一段，
+        # 快照后写覆盖池的 dict → 重启恢复时 list.items() AttributeError → 容器
+        # 启动循环崩溃。恢复失败绝不能带崩服务 —— 跳过恢复，零状态启动，
+        # save_state() 会用正确格式重写该段。键名冲突已在 state_snapshot 侧修复
+        # （快照观测副本改用 account_pool_status 键）。
+        if not isinstance(saved_accounts, dict):
+            self._log(
+                "[pool] WARN state 里的账号池段格式异常"
+                f"（accounts 为 {type(saved_accounts).__name__}），跳过恢复（零状态启动）"
+            )
+            return
         restored = 0
         for uid, st in saved_accounts.items():
             acct = self.accounts.get(uid)

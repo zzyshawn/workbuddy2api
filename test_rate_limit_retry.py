@@ -383,6 +383,53 @@ def test_stream_all_429_exhausted():
     print("✅ test_stream_all_429_exhausted")
 
 
+def test_restore_survives_corrupted_state():
+    """回归修复（2026-10-14 启动崩溃）：state 里 account_pool.accounts 为 list
+    形态（state_snapshot 旧键写坏）时，恢复必须跳过而非 AttributeError 崩启动。"""
+    import json as _json
+    import os
+    import tempfile
+    from account_pool import AccountPool
+
+    with tempfile.TemporaryDirectory() as td:
+        auth = os.path.join(td, "a.info")
+        with open(auth, "w", encoding="utf-8") as f:
+            _json.dump({"account": {"uid": "u1"},
+                        "auth": {"domain": "www.codebuddy.ai", "accessToken": "x"}}, f)
+        cfg = os.path.join(td, "accounts-intl.json")
+        with open(cfg, "w", encoding="utf-8") as f:
+            _json.dump({"default_uid": "u1",
+                        "accounts": [{"uid": "u1", "auth": "a.info", "priority": 1}]}, f)
+        state = os.path.join(td, "state.json")
+        # 污染形态：accounts 是 list（快照 status() 写坏的那种）
+        with open(state, "w", encoding="utf-8") as f:
+            _json.dump({"account_pool": {"multi_mode": True,
+                                         "accounts": [{"uid": "u1", "disabled": False}]}}, f)
+
+        pool = AccountPool(
+            env="intl", config_path=cfg, state_path=state,
+            default_proxy=None, legacy_auth_path=auth,
+            cred_factory=lambda p, px: SimpleNamespace(get_headers=lambda: {}),
+        )
+        assert pool.has_accounts(), "跳过坏段后应正常加载账号"
+
+        # 且随后 save_state() 用正确 dict 形态重写该段
+        pool.save_state()
+        good = _json.load(open(state, encoding="utf-8"))["account_pool"]["accounts"]
+        assert isinstance(good, dict) and "u1" in good, "save_state 应重写为 dict 形态"
+    print("✅ test_restore_survives_corrupted_state")
+
+
+def test_snapshot_uses_status_key():
+    """快照观测副本必须用 account_pool_status 键（与池持久化段 account_pool 分离，
+    防止 list 形态覆盖 dict 形态 —— 2026-10-14 启动崩溃根因）。"""
+    import state_snapshot
+    snap = state_snapshot.build_snapshot(account_pool=[{"uid": "u1"}])
+    assert "account_pool_status" in snap, "快照应写 account_pool_status 键"
+    assert "account_pool" not in snap, "快照不得占用池的持久化键 account_pool"
+    print("✅ test_snapshot_uses_status_key")
+
+
 if __name__ == "__main__":
     test_policy_defaults()
     test_429_is_not_account_fault()
@@ -393,4 +440,6 @@ if __name__ == "__main__":
     test_post_backend_filter_retry_429()
     test_stream_429_switches_account()
     test_stream_all_429_exhausted()
+    test_restore_survives_corrupted_state()
+    test_snapshot_uses_status_key()
     print("🎉 全部通过")
