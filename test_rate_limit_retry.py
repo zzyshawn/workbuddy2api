@@ -430,6 +430,50 @@ def test_snapshot_uses_status_key():
     print("✅ test_snapshot_uses_status_key")
 
 
+def test_task_runner_cache_invalidated_on_reload():
+    """回归修复（2026-10-14）：配置热加载重建账号后，任务侧 runner 缓存必须
+    按新 auth_path 重建 —— 否则定时任务继续用旧凭据路径（chat 正常、任务全挂）。"""
+    from pathlib import Path
+
+    import task_scheduler as ts_mod
+    from task_scheduler import TaskScheduler
+
+    new_path = "/data/auth/intl/new.info"
+    acct_new = SimpleNamespace(
+        uid="u1", auth_path=Path(new_path), proxy=None,
+        cred=SimpleNamespace(get_headers=lambda: {}),
+    )
+
+    class GettablePool(FakePool):
+        def get(self, uid):
+            return acct_new if uid == "u1" else None
+
+    cfg = ts_mod.TaskConfig(
+        checkin_enabled=False, travel_enabled=False, activity_enabled=False,
+        keepalive_enabled=False, school_enabled=False, cat_enabled=False,
+    )
+    ts = TaskScheduler(
+        cred=None, config=cfg, cache_dir=None, pool=GettablePool([FakeAcct("u1")]),
+        runners={"keepalive": "placeholder"}, log=lambda _m: None,
+    )
+    # 预填「旧路径」缓存（模拟 reload 前构建的 runner）
+    ts.account_runners["u1"] = {"k": "old-runner"}
+    ts._account_runner_paths["u1"] = "/data/auth/auth/intl/old.info"
+
+    rs = ts._runners_for_account("u1")
+
+    assert rs != {"k": "old-runner"}, "auth_path 变了必须重建，不能复用旧缓存"
+    # Windows 上 str(Path) 会把斜杠归一化成反斜杠，用 Path 比较保证跨平台
+    assert Path(ts._account_runner_paths["u1"]) == Path(new_path), "应记录新路径"
+    # 路径未变时走缓存
+    rs2 = ts._runners_for_account("u1")
+    assert rs2 is rs, "路径未变应命中缓存"
+    # 事件清空
+    ts.invalidate_runner_cache()
+    assert ts.account_runners == {} and ts._account_runner_paths == {}
+    print("✅ test_task_runner_cache_invalidated_on_reload")
+
+
 if __name__ == "__main__":
     test_policy_defaults()
     test_429_is_not_account_fault()
@@ -442,4 +486,5 @@ if __name__ == "__main__":
     test_stream_all_429_exhausted()
     test_restore_survives_corrupted_state()
     test_snapshot_uses_status_key()
+    test_task_runner_cache_invalidated_on_reload()
     print("🎉 全部通过")

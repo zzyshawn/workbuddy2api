@@ -166,6 +166,11 @@ class TaskScheduler(threading.Thread):
         #: self.runners 保持为"首选账号"那一套 —— /admin/* 与旧调用点走它。
         self._multi = pool is not None and runners is None and pool.has_accounts()
         self.account_runners: dict[str, dict] = {}
+        #: 与 account_runners 平行的「构建时 auth_path」记录：配置热加载会重建
+        #: PooledAccount（新 cred / 新 auth_path），比对不一致就重建 runners ——
+        #: 2026-10-14 实测：不改这个的话，改 accounts 配置后 chat 正常（走池的
+        #: 新对象），定时任务却继续用旧凭据路径（/data/auth/auth/...）。
+        self._account_runner_paths: dict[str, str] = {}
         #: 签到执行体单独留一个引用：/admin/checkin 需要它（且要保持旧状态结构）。
         self.checkin_runner: CheckinScheduler | None = self.runners.get("checkin")  # type: ignore[assignment]
 
@@ -281,20 +286,39 @@ class TaskScheduler(threading.Thread):
         return self.cache_dir / "accounts" / (safe or "default")
 
     def _runners_for_account(self, uid: str):
-        """取某账号的 runners（延迟构建并缓存；配置热加载新增的账号也能拿到）。"""
+        """取某账号的 runners（延迟构建并缓存；配置热加载新增的账号也能拿到）。
+
+        缓存键校验（2026-10-14 热加载 bug 修复）：reload 重建了 PooledAccount
+        （新 cred / 新 auth_path），但这里的 runners 缓存还绑着旧凭据对象 ——
+        实测症状：改 accounts 配置后 chat 正常（走池的新对象），定时任务却
+        继续报旧路径「/data/auth/auth/intl」。auth_path 不一致就重建。
+        """
         with self._lock:
             rs = self.account_runners.get(uid)
-        if rs is not None:
-            return rs
+            cached_path = self._account_runner_paths.get(uid)
         acct = self.pool.get(uid) if self.pool is not None else None
         if acct is None:
             return {}
+        cur_path = str(acct.auth_path)
+        if rs is not None and cached_path == cur_path:
+            return rs
         rs = self._build_runners_for(
             acct.cred, self.cfg.env, acct.proxy, self._account_cache_dir(uid)
         )
         with self._lock:
             self.account_runners[uid] = rs
+            self._account_runner_paths[uid] = cur_path
         return rs
+
+    def invalidate_runner_cache(self) -> None:
+        """配置热加载 / 账号重建后清空 runner 缓存（下一次任务按新配置重建）。
+
+        由装配处的 pool on_change 回调调用 —— reload 重建了 PooledAccount，
+        这里的缓存 runner 还绑着旧凭据对象，不清就会继续用旧 auth 路径。
+        """
+        with self._lock:
+            self.account_runners.clear()
+            self._account_runner_paths.clear()
 
     # ------------------------------------------------------------ 持久化
 

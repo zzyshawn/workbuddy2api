@@ -2972,6 +2972,12 @@ def _sync_default_cred():
 def _pool_changed():
     """账号池 on_change 回调：禁用/换首选/配置重载/重新登录恢复都会触发。"""
     _sync_default_cred()
+    tasks = CONFIG.get("tasks")
+    if tasks is not None:
+        # 热加载重建了账号对象 → 任务侧的 runners 缓存（绑着旧 cred）必须失效，
+        # 否则定时任务继续用旧 auth 路径（2026-10-14 实测：改配置后 chat 正常、
+        # 定时任务却全挂 —— 报 /data/auth/auth/ 双重路径）。
+        tasks.invalidate_runner_cache()
     snap = CONFIG.get("snapshot")
     if snap is not None:
         snap.request()  # 纯观测用途的快照刷新；持久化池自己已同步写完
