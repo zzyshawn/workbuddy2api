@@ -68,6 +68,30 @@ _SESSION_DEAD_MARKERS = ("Offline user session not found", "12153")
 #: 账号授权封禁（大小写不敏感，照抄上游 matchFold）。
 _ACCOUNT_BANNED_MARKERS = ("request illegal",)
 
+#: 上游临时拦截（2026-10-16 新形态，实测三路同响应）：HTTP 400 + code **11128** +
+#: msg "request illegal"，但 displayMsg 是「请求被拦截，请重新发送」—— 与账号
+#: 封禁（11140 / HTTP 403 /「内容未通过安全审核」/ 需重登）完全不同：VPS1 代理、
+#: VPS2 代理、国内直连、两个不同账号**同一响应** → 全局拦截，重试可自愈。
+#: 必须在 banned 判定**之前**排除 —— msg 同为 "request illegal"，按 msg 一刀切
+#: 会把整个池误判成封号清空（2026-10-16 实测事故）。
+_RETRYABLE_BLOCK_MARKERS = (
+    "send it again",
+    "请重新发送",
+    "請求已被攔截，請重新傳送",
+)
+
+
+def is_retryable_block(body: bytes | str | None) -> bool:
+    """上游临时拦截（11128「请重新发送」形态）——非账号故障，换号/退避可自愈。
+
+    调用方应在 classify_account_fault() **之前**调用本函数：两种形态的 msg
+    同为 "request illegal"，retryable 优先级更高。
+    """
+    if body is None:
+        return False
+    text = body.decode("utf-8", "replace") if isinstance(body, (bytes, bytearray)) else str(body)
+    return any(m in text for m in _RETRYABLE_BLOCK_MARKERS)
+
 #: 11140 的模型级限流变体 —— 命中它说明「不是账号故障」，
 #: classify 必须返回 None（保持原有行为：错误透传 / 网络重试，不禁用不换号）。
 _RATE_LIMIT_TEXT_MARKER = "rate-limiting requests"
@@ -79,15 +103,22 @@ def classify_account_fault(http_status: int, body: bytes | str | None) -> str | 
     返回禁用原因文案；返回 None 表示不是账号级故障（调用方保持原有行为）。
 
     规则（照抄上游，顺序也有语义）：
+      0. body 含「请求被拦截，请重新发送」（11128 临时拦截）→ 返回 None
+         （调用方走 RateLimitedError 换号+退避，绝不禁号 —— 2026-10-16 误判事故）
       1. body 含 "Offline user session not found" / "12153"（大小写敏感）→ session 失效
       2. body 含 "request illegal"（大小写不敏感）→ 账号授权封禁（11140）
     注意：只看 msg 文案，不看 code / HTTP 状态 —— 11140 的 code 也承载模型级限流文案，
-    那种必须保持原有处理，不能当账号故障。
+    那种必须保持原有处理，不能当账号故障。11128 与 11140 的 msg 同为
+    "request illegal"，靠第 0 步的 displayMsg 区分。
     """
     if body is None:
         return None
     text = body.decode("utf-8", "replace") if isinstance(body, (bytes, bytearray)) else str(body)
     if not text:
+        return None
+    # 第 0 步：临时拦截（11128「请重新发送」）→ 非账号故障，调用方走换号+退避。
+    # 必须先于 banned 判定：两种形态 msg 同为 "request illegal"。
+    if is_retryable_block(text):
         return None
     # 大小写敏感（上游 matchExact）：session 失效的文案是上游固定写法。
     for marker in _SESSION_DEAD_MARKERS:

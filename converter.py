@@ -1782,6 +1782,13 @@ async def _chat_nonstream_once(acct, url: str, body: dict, model_name: str, rid:
                             f"[{rid}] ✗ HTTP {r.status_code} | {model_name} | {_truncate(raw.decode('utf-8', 'replace'), 200)}"
                         )
                         _log_body(f"[{rid}] ── ERROR BODY ──\n{raw.decode('utf-8', 'replace')}")
+                        # 临时拦截（11128「请重新发送」）→ RateLimitedError 换号+退避，绝不禁号
+                        # （2026-10-16 误判事故：11128 与 11140 msg 同为 request illegal，
+                        #   按 msg 一刀切把整个池误判成封号清空）
+                        if account_pool.is_retryable_block(raw):
+                            raise account_pool.RateLimitedError(
+                                acct.uid, r.status_code, raw
+                            )
                         reason = account_pool.classify_account_fault(r.status_code, raw)
                         if reason is not None:
                             raise account_pool.AccountFaultError(
@@ -1918,6 +1925,14 @@ async def _stream_upstream(
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     err = await r.aread()
+                    # 临时拦截（11128「请重新发送」）→ 与 429 同路径：换号+整圈退避，绝不禁号
+                    if account_pool.is_retryable_block(err):
+                        box["rate_limited"] = True
+                        _log(
+                            f"{prefix}⇄ 账号 {account_pool.short_uid(acct.uid)} 上游临时拦截"
+                            f"（11128 request illegal），换下一个账号（不禁号）"
+                        )
+                        return
                     reason = account_pool.classify_account_fault(r.status_code, err)
                     if reason is not None:
                         pool.mark_account_fault(acct.uid, reason, http_status=r.status_code)
@@ -2153,6 +2168,14 @@ async def _post_backend_with_filter_retry(
             status, raw = await _post_backend_once(
                 url, headers, body, proxy=acct.proxy, rid=rid, model_name=model_name
             )
+            # 临时拦截（11128「请重新发送」）→ 与 429 同路径换号；整圈全拦由外层退避。
+            if status == 429 or account_pool.is_retryable_block(raw):
+                _log(
+                    f"{prefix}⇄ 账号 {account_pool.short_uid(acct.uid)} "
+                    f"{'429 限流' if status == 429 else '上游临时拦截（11128）'}，"
+                    f"换下一个账号（不禁号）"
+                )
+                continue
             reason = account_pool.classify_account_fault(status, raw)
             if reason is not None:
                 all_rate_limited = False
@@ -2556,6 +2579,11 @@ async def _anthropic_nonstream_once(
                         _log(
                             f"{prefix}✗ HTTP {r.status_code} | {model_name} | {_truncate(err.decode('utf-8', 'replace'), 200)}"
                         )
+                        # 临时拦截（11128「请重新发送」）→ RateLimitedError 换号+退避，绝不禁号
+                        if account_pool.is_retryable_block(err):
+                            raise account_pool.RateLimitedError(
+                                acct.uid, r.status_code, err
+                            )
                         reason = account_pool.classify_account_fault(r.status_code, err)
                         if reason is not None:
                             raise account_pool.AccountFaultError(
@@ -2643,6 +2671,14 @@ async def _stream_anthropic(
             async with c.stream("POST", url, headers=headers, json=body) as r:
                 if r.status_code != 200:
                     err = await r.aread()
+                    # 临时拦截（11128「请重新发送」）→ 与 429 同路径：换号+整圈退避，绝不禁号
+                    if account_pool.is_retryable_block(err):
+                        box["rate_limited"] = True
+                        _log(
+                            f"{prefix}⇄ 账号 {account_pool.short_uid(acct.uid)} 上游临时拦截"
+                            f"（11128 request illegal），换下一个账号（不禁号）"
+                        )
+                        return
                     reason = account_pool.classify_account_fault(r.status_code, err)
                     if reason is not None:
                         pool.mark_account_fault(acct.uid, reason, http_status=r.status_code)

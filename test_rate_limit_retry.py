@@ -474,6 +474,65 @@ def test_task_runner_cache_invalidated_on_reload():
     print("✅ test_task_runner_cache_invalidated_on_reload")
 
 
+def test_11128_block_is_not_ban():
+    """回归修复（2026-10-16 误判事故）：上游新拦截形态 HTTP 400 + code 11128 +
+    msg "request illegal" + displayMsg「请重新发送」—— 是**临时拦截**不是封禁。
+    旧逻辑按 msg 一刀切把两个好号永久禁用、池清空。"""
+    body = (b'{"code":11128,"msg":"request illegal",'
+            b'"displayMsg":{"en":"Request blocked. Please send it again",'
+            b'"zh":"\xe8\xaf\xb7\xe6\xb1\x82\xe8\xa2\xab\xe6\x8b\xa6\xe6\x88\xaa\xef\xbc\x8c'
+            b'\xe8\xaf\xb7\xe9\x87\x8d\xe6\x96\xb0\xe5\x8f\x91\xe9\x80\x81"}}')
+    assert converter.account_pool.is_retryable_block(body), "应识别为临时拦截"
+    assert converter.account_pool.classify_account_fault(400, body) is None, \
+        "临时拦截绝不能判成账号封禁"
+    # 反向：真封禁（11140/403）仍应命中（displayMsg 无「请重新发送」）
+    ban = (b'{"code":11140,"msg":"request illegal",'
+           b'"displayMsg":{"en":"The content did not pass the safety review"}}')
+    assert not converter.account_pool.is_retryable_block(ban)
+    assert converter.account_pool.classify_account_fault(403, ban) is not None
+    print("✅ test_11128_block_is_not_ban")
+
+
+def test_stream_11128_block_switches_account():
+    """流式：11128 临时拦截 → 同请求内换号（不禁号），B 号正常出流。"""
+    pool = FakePool([FakeAcct("a"), FakeAcct("b")])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        uid = request.headers.get("X-User-Id", "")
+        if uid == "a":
+            return httpx.Response(
+                400,
+                json={"code": 11128, "msg": "request illegal",
+                      "displayMsg": {"zh": "请求被拦截，请重新发送"}},
+            )
+        return httpx.Response(
+            200,
+            content=b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+        )
+
+    orig = _sse_client(handler)
+    saved = _save_rl_config()
+    try:
+        converter.CONFIG["rate_limit_retry"] = RL_RETRIES
+        converter.CONFIG["rate_limit_retry_gap"] = RL_GAP
+
+        async def run():
+            chunks = []
+            async for chunk in converter._stream_upstream(
+                "http://x/v2/chat/completions", pool, {}, model_name="m", rid="t9"
+            ):
+                chunks.append(chunk)
+            return b"".join(chunks)
+
+        out = asyncio.run(run())
+    finally:
+        environments.make_async_client = orig
+        _restore_rl_config(saved)
+    assert b"ok" in out, f"B 号应正常出流，实际 {out[:200]}"
+    assert pool.faults == [], "11128 临时拦截绝不能禁号"
+    print("✅ test_stream_11128_block_switches_account")
+
+
 if __name__ == "__main__":
     test_policy_defaults()
     test_429_is_not_account_fault()
@@ -487,4 +546,6 @@ if __name__ == "__main__":
     test_restore_survives_corrupted_state()
     test_snapshot_uses_status_key()
     test_task_runner_cache_invalidated_on_reload()
+    test_11128_block_is_not_ban()
+    test_stream_11128_block_switches_account()
     print("🎉 全部通过")
