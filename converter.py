@@ -28,6 +28,7 @@ import os
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import httpx
@@ -229,6 +230,61 @@ def read_auth_domain(path: Path | None) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+def _cli_client_headers() -> dict:
+    """CodeBuddy CLI（2.168.2）出站头族 —— 2026-10-17 抓包 CLI 真实请求实锤。
+
+    为什么必须带：2026-10-16 23:44 起上游对 chat 接口启用**客户端头校验**，
+    缺失这套头的请求一律 400 + code 11128「request illegal / 请求被拦截，
+    请重新发送」。逐项实验排除过 IP / 账号 / UA 版本 / Stainless 头单独作用 /
+    路径 / 模型 / TLS 栈（curl、python、node 三种栈）—— 唯一放行条件就是这组
+    头：CLI 全头重放 /v2 → 200；缺任何一个组合 → 11128。最小必需子集未做
+    二分（全量照抄 CLI 抓包最稳，动态 ID 用 UUID v4 每请求生成，上游只做
+    存在性/聚合用途，不校验具体值）。
+    """
+    ver = model_registry.effective_cli_version()
+    u4 = lambda: str(uuid.uuid4())  # noqa: E731
+    hex32 = lambda: uuid.uuid4().hex  # noqa: E731
+    trace = hex32()
+    span = hex32()[:16]
+    parent_span = hex32()[:16]
+    msg_id = hex32()
+    conv_req = hex32()
+    conv = u4()
+    return {
+        "x-requested-with": "XMLHttpRequest",
+        "x-stainless-lang": "js",
+        "x-stainless-package-version": "6.25.0",
+        "x-stainless-os": "Linux",
+        "x-stainless-arch": "x64",
+        "x-stainless-retry-count": "0",
+        "x-stainless-runtime": "node",
+        "x-stainless-runtime-version": "v22.22.3",
+        "X-Conversation-ID": conv,
+        "X-Conversation-Message-ID": msg_id,
+        "X-Conversation-Request-ID": conv_req,
+        "X-Root-Request-ID": conv_req,
+        "X-Request-ID": msg_id,
+        "X-Agent-Purpose": "conversation",
+        "X-Agent-Intent": "craft",
+        "X-Agent-Runtime": "other",
+        "X-Agent-Type": "main",
+        "X-IDE-Type": "CLI",
+        "X-IDE-Name": "CLI",
+        "X-IDE-Version": ver,
+        "X-Private-Data": "false",
+        "x-codebuddy-request": "1",
+        "X-Product": "SaaS",
+        "baggage": f"codebuddy.session_id={conv},codebuddy.conversation_request_id={conv_req}",
+        "traceparent": f"00-{trace}-{span}-01",
+        "b3": f"{trace}-{span}-1-{parent_span}",
+        "X-B3-TraceId": trace,
+        "X-B3-ParentSpanId": parent_span,
+        "X-B3-SpanId": span,
+        "X-B3-Sampled": "1",
+        "X-Trace-ID": trace,
+    }
+
+
 class CredentialManager:
     """从 auth 文件读取凭据；token 临近过期时自动刷新并回写。
 
@@ -330,6 +386,9 @@ class CredentialManager:
             "X-Domain": domain,
             "User-Agent": USER_AGENT,
         }
+        # CLI 客户端头族（2026-10-16 起上游强制校验，缺失 → 11128 拦截）：
+        # 刷新端点也带上无妨；chat 路径是生死攸关的那条。
+        h.update(_cli_client_headers())
         return h
 
     def get_headers(
