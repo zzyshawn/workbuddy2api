@@ -36,7 +36,7 @@ from typing import Callable
 
 # 账号池状态段与快照共用一个 state 文件，写盘时用它的文件锁互斥
 # （account_pool 不 import 本模块，无循环导入之忧）。
-from account_pool import state_file_lock
+from account_pool import STATE_SECTION as POOL_PERSIST_SECTION, read_state_section, state_file_lock
 
 #: 快照文件名。放日志目录下，跟着 logs/ 一起挂载。
 SNAPSHOT_NAME = "state.json"
@@ -308,6 +308,16 @@ class SnapshotWriter(threading.Thread):
                     self.last_error = f"采集失败：{e}"
                     self._log(f"[state] ERR 采集失败：{e}")
                     return False
+                # 保留池持久化段（account_pool，dict 形态）：快照顶层不含它
+                # （2026-10-14 键名分离后快照只有 account_pool_status 观测键），
+                # 全量覆盖写会把 save_state() 刚落的禁用状态抹掉 —— 禁用重启复活
+                # （2026-10-16 实测：23:44 禁用两号，快照覆盖后 state 里段消失）。
+                try:
+                    pool_section = read_state_section(self.path, POOL_PERSIST_SECTION)
+                    if pool_section is not None:
+                        data[POOL_PERSIST_SECTION] = pool_section
+                except Exception as e:  # noqa: BLE001 — 回填失败不阻断写盘
+                    self._log(f"[state] WARN 回填账号池段失败：{e}")
                 if write_atomic(self.path, data):
                     self.writes += 1
                     self.last_write_ts = time.time()
